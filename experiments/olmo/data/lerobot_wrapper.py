@@ -31,6 +31,7 @@ Set `LEROBOT_STATE_FORMAT` to one of {"continuous", "discrete", "both"}:
 - continuous: pass normalized continuous state vectors to the action expert only
 - discrete: serialize normalized state vectors into tokenizer input only
 - both: use both continuous action-expert state and discrete state tokens in the input
+Set `LEROBOT_STATIC_THRESHOLD` > 0 to drop transitions whose raw state delta is static.
 """
 
 import hashlib
@@ -1410,6 +1411,7 @@ class LeRobotDatasetWrapper(Dataset):
         observation_indices: Sequence[int],
         action_indices: Sequence[int],
         drop_n_last_frames: int = 0,
+        static_threshold: float = 0.0,
         style: str = "demo",
         style_sampling_rates: Optional[Dict[str, float]] = None,
         action_format: str = "continuous",
@@ -1584,6 +1586,9 @@ class LeRobotDatasetWrapper(Dataset):
             drop_n_last_frames,
             label="drop_n_last_frames",
         )
+        self.static_threshold = float(static_threshold)
+        if self.static_threshold < 0:
+            raise ValueError(f"static_threshold must be >= 0, got {self.static_threshold}.")
         self.tag_action_horizon = _require_positive_int(
             tag_action_horizon,
             label="tag_action_horizon",
@@ -1633,7 +1638,10 @@ class LeRobotDatasetWrapper(Dataset):
         self._warned_camera_order_episode_fallback = False
         self._episode_ranges: Optional[List[Tuple[int, int]]] = None
         self._episode_cumulative: Optional[List[int]] = None
+        self._sample_indices: Optional[List[int]] = None
         self._effective_len: Optional[int] = None
+        self.static_filter_total_frames = 0
+        self.static_filter_static_frames = 0
         self._cached_dataset_len: Optional[int] = len(self.dataset) if self.dataset is not None else None
         self._action_discrete_processor = None
         self._annotated_tasks_loaded = False
@@ -1681,7 +1689,10 @@ class LeRobotDatasetWrapper(Dataset):
         )
         self._episode_ranges = None
         self._episode_cumulative = None
+        self._sample_indices = None
         self._effective_len = None
+        self.static_filter_total_frames = 0
+        self.static_filter_static_frames = 0
         self._build_episode_index()
 
     def _load_depth_dataset_from_kwargs(self, depth_kwargs: Dict[str, Any]) -> LeRobotDataset:
@@ -2529,11 +2540,13 @@ class LeRobotDatasetWrapper(Dataset):
         return state, action, metadata
 
     def _build_episode_index(self) -> None:
-        if self.drop_n_last_frames <= 0:
+        self.static_filter_total_frames = 0
+        self.static_filter_static_frames = 0
+        if self.drop_n_last_frames <= 0 and self.static_threshold <= 0:
             return
         meta = getattr(self.dataset, "meta", None)
         if meta is None or not hasattr(meta, "episodes"):
-            log.warning("LeRobot dataset metadata missing episodes; drop_n_last_frames ignored.")
+            log.warning("LeRobot dataset metadata missing episodes; frame filtering ignored.")
             return
         episode_ids = (
             list(self.dataset.episodes)
@@ -2541,9 +2554,29 @@ class LeRobotDatasetWrapper(Dataset):
             else list(range(getattr(meta, "total_episodes", len(meta.episodes))))
         )
         absolute_to_relative = getattr(self.dataset, "_absolute_to_relative_idx", None)
+        hf_dataset = getattr(self.dataset, "hf_dataset", None)
+        kept_indices: Optional[List[int]] = [] if self.static_threshold > 0 else None
+        static_filter_total = 0
         ranges: List[Tuple[int, int]] = []
         cumulative: List[int] = []
         total = 0
+
+        def map_abs_index(abs_idx: int) -> Optional[int]:
+            if absolute_to_relative is None:
+                return int(abs_idx)
+            rel_idx = absolute_to_relative.get(int(abs_idx))
+            return None if rel_idx is None else int(rel_idx)
+
+        def raw_state_at(row_idx: int) -> Optional[np.ndarray]:
+            if hf_dataset is not None:
+                row = hf_dataset[row_idx]
+            else:
+                row = self.dataset[row_idx]
+            state, _ = _extract_vector(row, self.state_keys, "observation.state.")
+            if state is None:
+                return None
+            return np.asarray(state, dtype=np.float32).reshape(-1)
+
         for ep_idx in episode_ids:
             try:
                 ep = meta.episodes[ep_idx]
@@ -2555,11 +2588,11 @@ class LeRobotDatasetWrapper(Dataset):
             start = start_abs
             trimmed_end = trimmed_end_abs
             if absolute_to_relative is not None and trimmed_end_abs > start_abs:
-                rel_start = absolute_to_relative.get(start_abs)
-                rel_last = absolute_to_relative.get(trimmed_end_abs - 1)
+                rel_start = map_abs_index(start_abs)
+                rel_last = map_abs_index(trimmed_end_abs - 1)
                 if rel_start is None or rel_last is None:
                     log.warning(
-                        "Skipping episode %s for drop_n_last_frames because absolute frame range [%s, %s) "
+                        "Skipping episode %s for frame filtering because absolute frame range [%s, %s) "
                         "is not present in the filtered dataset for repo '%s'.",
                         ep_idx,
                         start_abs,
@@ -2571,17 +2604,65 @@ class LeRobotDatasetWrapper(Dataset):
                 trimmed_end = int(rel_last) + 1
             if trimmed_end <= start:
                 continue
+            if kept_indices is not None:
+                previous_state: Optional[np.ndarray] = None
+                episode_kept = 0
+                for abs_idx in range(start_abs, trimmed_end_abs):
+                    row_idx = map_abs_index(abs_idx)
+                    if row_idx is None:
+                        continue
+                    state = raw_state_at(row_idx)
+                    if state is None:
+                        continue
+                    static_filter_total += 1
+                    keep = previous_state is None
+                    if previous_state is not None:
+                        joint_diff = np.abs(state - previous_state)
+                        keep = bool(np.any(joint_diff > self.static_threshold, axis=-1))
+                    previous_state = state
+                    if keep:
+                        kept_indices.append(row_idx)
+                        episode_kept += 1
+                if episode_kept <= 0:
+                    log.warning(
+                        "Static-frame filtering removed all samples for episode %s in repo '%s'.",
+                        ep_idx,
+                        self._get_repo_id(),
+                    )
+                continue
             total += trimmed_end - start
             ranges.append((start, trimmed_end))
             cumulative.append(total)
-        if ranges:
+        if kept_indices is not None:
+            static_filter_static = max(static_filter_total - len(kept_indices), 0)
+            self.static_filter_total_frames = static_filter_total
+            self.static_filter_static_frames = static_filter_static
+            if kept_indices:
+                self._sample_indices = kept_indices
+                self._effective_len = len(kept_indices)
+                log.info(
+                    "LeRobot static-frame filtering for repo '%s' kept %d/%d samples with threshold=%g "
+                    "(static_ratio=%0.4f).",
+                    self._get_repo_id(),
+                    len(kept_indices),
+                    static_filter_total,
+                    self.static_threshold,
+                    (static_filter_static / static_filter_total) if static_filter_total else 0.0,
+                )
+            else:
+                log.warning("static_threshold removed all samples; falling back to full dataset.")
+        elif ranges:
             self._episode_ranges = ranges
             self._episode_cumulative = cumulative
             self._effective_len = total
         else:
-            log.warning("drop_n_last_frames removed all samples; falling back to full dataset.")
+            log.warning("Frame filtering removed all samples; falling back to full dataset.")
 
     def _map_index(self, item: int) -> int:
+        if self._sample_indices is not None:
+            if item < 0 or item >= len(self._sample_indices):
+                raise IndexError(f"Index {item} out of bounds for filtered dataset.")
+            return self._sample_indices[item]
         if self._episode_ranges is None or self._episode_cumulative is None:
             return item
         if item < 0 or item >= self._episode_cumulative[-1]:
@@ -2995,6 +3076,9 @@ def build_lerobot_dataset(
         drop_n_last_frames = 0
     else:
         drop_n_last_frames = _require_non_negative_int(drop_n_last_frames, label="drop_n_last_frames")
+    static_threshold = _get_env_float("LEROBOT_STATIC_THRESHOLD", 0.0)
+    if static_threshold < 0:
+        raise ValueError(f"LEROBOT_STATIC_THRESHOLD must be >= 0, got {static_threshold}.")
     video_backend = _get_env_str("LEROBOT_VIDEO_BACKEND", "pyav")
     tolerance_s = _get_env_float("LEROBOT_TOLERANCE_S", 1e-3)
     action_format = _get_required_env_choice(
@@ -3319,6 +3403,7 @@ def build_lerobot_dataset(
         observation_indices=obs_indices,
         action_indices=action_indices,
         drop_n_last_frames=drop_n_last_frames,
+        static_threshold=static_threshold,
         style=style,
         style_sampling_rates=style_sampling_rates,
         action_format=action_format,

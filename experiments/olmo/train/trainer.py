@@ -213,6 +213,40 @@ def lerobot_tag_sampling_rate_metrics(
     }
 
 
+def _collect_static_filter_counts(dataset: Any) -> Tuple[int, int]:
+    if dataset is None:
+        return 0, 0
+
+    total = getattr(dataset, "static_filter_total_frames", None)
+    static = getattr(dataset, "static_filter_static_frames", None)
+    if total is not None and static is not None:
+        return int(static), int(total)
+
+    static_count = 0
+    total_count = 0
+    for child in getattr(dataset, "datasets", []) or []:
+        child_static, child_total = _collect_static_filter_counts(child)
+        static_count += child_static
+        total_count += child_total
+
+    inner = getattr(dataset, "dataset", None)
+    if inner is not None and inner is not dataset:
+        inner_static, inner_total = _collect_static_filter_counts(inner)
+        static_count += inner_static
+        total_count += inner_total
+
+    return static_count, total_count
+
+
+def static_filter_ratio_metrics(label: str, loader: Optional[DataLoader]) -> Dict[str, float]:
+    if loader is None:
+        return {}
+    static_count, total_count = _collect_static_filter_counts(getattr(loader, "dataset", None))
+    if total_count <= 0:
+        return {}
+    return {f"{label}/static_ratio": float(static_count) / float(total_count)}
+
+
 @dataclass
 class BeakerLogger:
     WANDB_REGEX = ".*( \(https://wandb.ai/.*\))$"
@@ -2413,6 +2447,17 @@ class Trainer:
             if wandb.run is not None:
                 wandb.log(lerobot_sampling_metrics, step=0)
             self.log_metrics_to_tensorboard(lerobot_sampling_metrics, 0)
+
+        static_ratio_metrics = {}
+        static_ratio_metrics.update(static_filter_ratio_metrics("train", self.train_loader))
+        static_ratio_metrics.update(static_filter_ratio_metrics("train_vlm", self.vlm_loader))
+        for evaluator in self.evaluators or []:
+            static_ratio_metrics.update(static_filter_ratio_metrics(evaluator.label, evaluator.eval_loader))
+        if static_ratio_metrics:
+            self.log_metrics_to_console("LeRobot static frame ratios", static_ratio_metrics)
+            if wandb.run is not None:
+                wandb.log(static_ratio_metrics, step=0)
+            self.log_metrics_to_tensorboard(static_ratio_metrics, 0)
 
         # Python Profiler stuff
         if self.cfg.python_profiling:
