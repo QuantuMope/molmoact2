@@ -11,8 +11,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-import debugpy
-
 from omegaconf import omegaconf, OmegaConf
 from launch_scripts.data_mixtures import TAG_METADATA_BY_TAG
 from launch_scripts.lerobot_utils.env import (
@@ -78,7 +76,7 @@ from olmo.torch_util import get_world_size
 from olmo.train.optim import OptimizerConfig, OptimizerType, SchedulerConfig, SchedulerType
 from olmo.train.run_trainer import run_trainer
 from olmo.train.trainer_config import TrainConfig, CompilerConfig, FSDPConfig, BatchDivisor, \
-    SpeedMonitorConfig, WandbConfig
+    SpeedMonitorConfig, TensorBoardConfig
 from olmo.util import (
     clean_opt,
     is_hf_checkpoint_ref,
@@ -444,6 +442,8 @@ def main():
 
     if args.debugger:
         if os.environ.get("RANK", "0") == "0":
+            import debugpy
+
             # Listen on port 5678 (adjust if needed)
             debugpy.listen(("172.17.0.1", 5678))
             print("Debugger is listening on port 5678. Waiting for client to attach...")
@@ -806,14 +806,10 @@ def main():
         seed=6198,
         dry_run=False,
 
-        wandb=None if args.debug else WandbConfig(
-            name="${run_name}",
-            project="${oc.env:WANDB_PROJECT}",
-            group=None,
-            entity="${oc.env:WANDB_ENTITY}",
+        wandb=None,
+        tensorboard=TensorBoardConfig(
+            log_dir="${save_folder}/tensorboard",
             log_interval=log_interval,
-            allow_resume=True,
-            finish_on_sigterm=True
         ),
         compile=None if dynamic_sequence_length else CompilerConfig(mode="default", dynamic=False),
         fused_loss=False,

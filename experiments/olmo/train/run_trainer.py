@@ -559,6 +559,22 @@ def run_trainer(cfg: TrainConfig) -> None:
                          f"token is missing, so beaker logging will turned off")
         beaker_logger = None
 
+    tensorboard_writer = None
+    if cfg.tensorboard is not None and (get_global_rank() == 0 or not cfg.tensorboard.rank_zero_only):
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "TensorBoard logging requires the `tensorboard` package. "
+                "Install it in this environment, e.g. `pip install tensorboard`."
+            ) from exc
+        log_dir = cfg.tensorboard.log_dir or str(Path(cfg.save_folder) / "tensorboard")
+        tensorboard_writer = SummaryWriter(
+            log_dir=log_dir,
+            flush_secs=int(cfg.tensorboard.flush_secs),
+        )
+        log.info("TensorBoard logs will be written to %s", log_dir)
+
     # Maybe start W&B run.
     if cfg.wandb is not None and (get_global_rank() == 0 or not cfg.wandb.rank_zero_only):
         wandb_dir = Path(cfg.save_folder) / "wandb"
@@ -654,6 +670,7 @@ def run_trainer(cfg: TrainConfig) -> None:
         evaluators=evaluators,
         inference_evaluators=inf_evaluators,
         beaker_logger=beaker_logger,
+        tensorboard_writer=tensorboard_writer,
     ) as trainer:
         lora_injected = False
         if model_cfg.lora_enable and checkpoint_has_lora:

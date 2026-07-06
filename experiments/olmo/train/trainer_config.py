@@ -38,8 +38,8 @@ from olmo.dist_util import _check_num_replicas, get_num_nodes, _check_shard_degr
 __all__ = [
     "SpeedMonitorConfig",
     "WandbConfig",
+    "TensorBoardConfig",
     "CompilerConfig",
-    "WandbConfig",
     "FSDPPrecision",
     "FSDPConfig",
 ]
@@ -63,6 +63,14 @@ class WandbConfig(BaseConfig):
     log_interval: int = 1
     allow_resume: bool = False
     finish_on_sigterm: bool = False
+
+
+@dataclass
+class TensorBoardConfig(BaseConfig):
+    log_dir: Optional[str] = None
+    log_interval: int = 1
+    rank_zero_only: bool = True
+    flush_secs: int = 30
 
 
 @dataclass
@@ -825,6 +833,11 @@ class TrainConfig(BaseConfig):
     wandb: Optional[WandbConfig] = None
     """
     Weights & Biases configuration.
+    """
+
+    tensorboard: Optional[TensorBoardConfig] = None
+    """
+    TensorBoard configuration.
     """
 
     beaker_log_interval: int = 50
