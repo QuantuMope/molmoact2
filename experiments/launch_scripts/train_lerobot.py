@@ -73,6 +73,7 @@ from olmo.preprocessing.multicrop_preprocessor import MultiCropConfig
 from olmo.preprocessing.image_preprocessor import SUPPORTED_IMAGE_AUGMENTATION_MODES
 from olmo.tokenizer import DEFAULT_PAD_MULTIPLE
 from olmo.torch_util import get_world_size
+from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig
 from olmo.train.optim import OptimizerConfig, OptimizerType, SchedulerConfig, SchedulerType
 from olmo.train.run_trainer import run_trainer
 from olmo.train.trainer_config import TrainConfig, CompilerConfig, FSDPConfig, BatchDivisor, \
@@ -204,6 +205,25 @@ def main():
     parser.add_argument("--log_interval", default=20, type=int)
     parser.add_argument("--max_loss_examples", default=2048, type=int)
     parser.add_argument("--max_inf_eval_examples", default=1280, type=int)
+    parser.add_argument(
+        "--eval_split",
+        default=0.0,
+        type=float,
+        help="Fraction of each LeRobot repo's episodes to hold out for validation. Disabled when 0.",
+    )
+    parser.add_argument("--eval_split_seed", default=0, type=int)
+    parser.add_argument("--eval_interval", default=2000, type=int)
+    parser.add_argument("--eval_device_batch_size", default=None, type=int)
+    parser.add_argument("--eval_num_workers", default=None, type=int)
+    parser.add_argument(
+        "--static_threshold",
+        default=0.0,
+        type=float,
+        help=(
+            "If > 0, remove LeRobot transitions whose unnormalized joint-state "
+            "change is not greater than this threshold in any dimension."
+        ),
+    )
     parser.add_argument("--prefetch_factor", default=4, type=int)
     parser.add_argument("--num_workers", default=6, type=int)
     parser.add_argument("--connector_learning_rate", default=5e-6, type=float)
@@ -423,6 +443,18 @@ def main():
     )
     _reject_removed_action_training_flags(argv_tokens)
     args, other_args = parser.parse_known_args()
+    if not 0.0 <= float(args.eval_split) < 1.0:
+        raise ValueError("--eval_split must be in [0, 1).")
+    if args.eval_split > 0.0 and args.eval_interval <= 0:
+        raise ValueError("--eval_interval must be > 0 when --eval_split > 0.")
+    if args.eval_device_batch_size is not None and args.eval_device_batch_size < 1:
+        raise ValueError("--eval_device_batch_size must be >= 1 when provided.")
+    if args.eval_num_workers is not None and args.eval_num_workers < 0:
+        raise ValueError("--eval_num_workers must be >= 0 when provided.")
+    if args.static_threshold < 0:
+        raise ValueError("--static_threshold must be >= 0.")
+    if args.eval_split_seed < 0:
+        raise ValueError("--eval_split_seed must be >= 0.")
     _validate_continuous_action_training_args(args.action_format)
     args.discrete_action_tokenizer = None
 
@@ -790,6 +822,31 @@ def main():
             action_chunk_cap=args.packed_action_chunk_cap,
         ) if args.packing else None,
     )
+    if args.eval_split > 0.0:
+        eval_data_cfg = replace(
+            primary_data_cfg,
+            shuffle=False,
+            split="validation",
+            drop_last=False,
+            num_workers=args.eval_num_workers if args.eval_num_workers is not None else num_workers,
+            packing=None,
+            skip_overlong_examples=False,
+            skip_missing_vlm_examples=False,
+        )
+        loss_evaluations.append(
+            LossDatasetEvaluatorConfig(
+                label="lerobot_val",
+                data=eval_data_cfg,
+                device_batch_size=(
+                    args.eval_device_batch_size
+                    if args.eval_device_batch_size is not None
+                    else args.device_batch_size
+                ),
+                max_examples=args.max_loss_examples,
+                console_log_interval=log_interval,
+                response_logits_only=True,
+            )
+        )
     vlm_data_cfg = None
     if args.separate_vlm_dataloader:
         assert vlm_mixture is not None
@@ -873,7 +930,7 @@ def main():
         inf_evaluators=evaluations,
         evaluators=loss_evaluations,
         inf_eval_interval=2000,
-        eval_interval=2000,
+        eval_interval=args.eval_interval,
         save_final_unsharded_checkpoint=False,
         save_merged_lora_checkpoint=True,
         save_final_optim=True,

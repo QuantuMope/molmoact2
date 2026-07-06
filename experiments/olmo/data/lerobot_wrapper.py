@@ -535,6 +535,78 @@ def _normalize_episode_list(values: Iterable[Number]) -> List[int]:
     return sorted({int(v) for v in values})
 
 
+def _resolve_total_episodes(repo_id: str, dataset_root: Optional[Path]) -> int:
+    metadata_kwargs = dict(
+        repo_id=repo_id,
+        root=str(dataset_root) if dataset_root else None,
+    )
+    try:
+        metadata = LeRobotDatasetMetadata(**metadata_kwargs)
+    except Exception as exc:
+        if not _should_retry_with_main_revision(exc):
+            raise
+        log.warning(
+            "LeRobot metadata init failed for %s (%s). Retrying with revision='main'.",
+            repo_id,
+            exc,
+        )
+        metadata = LeRobotDatasetMetadata(**metadata_kwargs, revision="main")
+    return int(metadata.total_episodes)
+
+
+def _select_split_episodes(
+    episodes: Optional[List[int]],
+    split: str,
+    *,
+    repo_id: str,
+    dataset_root: Optional[Path],
+) -> Optional[List[int]]:
+    eval_fraction = _get_env_float("LEROBOT_EVAL_SPLIT", 0.0)
+    if eval_fraction <= 0.0:
+        return episodes
+    if not 0.0 < eval_fraction < 1.0:
+        raise ValueError(f"LEROBOT_EVAL_SPLIT must be in (0, 1), got {eval_fraction}.")
+
+    normalized_split = str(split).strip().lower()
+    if normalized_split not in {"train", "validation", "val", "eval"}:
+        return episodes
+
+    if episodes is None:
+        total_episodes = _resolve_total_episodes(repo_id, dataset_root)
+        base_episodes = list(range(total_episodes))
+    else:
+        base_episodes = list(episodes)
+    if len(base_episodes) < 2:
+        raise ValueError(
+            f"Cannot apply LEROBOT_EVAL_SPLIT={eval_fraction} to {repo_id}: "
+            f"need at least 2 episodes, found {len(base_episodes)}."
+        )
+
+    seed = _get_env_non_negative_int("LEROBOT_EVAL_SPLIT_SEED", 0)
+    rng = np.random.default_rng(seed)
+    shuffled = np.asarray(base_episodes, dtype=np.int64).copy()
+    rng.shuffle(shuffled)
+    n_eval = int(round(len(base_episodes) * eval_fraction))
+    n_eval = min(max(n_eval, 1), len(base_episodes) - 1)
+    eval_episodes = set(int(v) for v in shuffled[:n_eval])
+
+    if normalized_split == "train":
+        selected = [ep for ep in base_episodes if ep not in eval_episodes]
+    else:
+        selected = [ep for ep in base_episodes if ep in eval_episodes]
+    selected = sorted(selected)
+    log.info(
+        "LeRobot %s split for %s: selected %d/%d episodes with eval_split=%s seed=%d.",
+        normalized_split,
+        repo_id,
+        len(selected),
+        len(base_episodes),
+        eval_fraction,
+        seed,
+    )
+    return selected
+
+
 def _get_env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -2969,6 +3041,13 @@ def build_lerobot_dataset(
         # LeRobotDataset will download into this location.
         dataset_root = base_path / dataset_repo_id
 
+    selected_episodes = _select_split_episodes(
+        parsed.episodes,
+        split,
+        repo_id=dataset_repo_id,
+        dataset_root=dataset_root,
+    )
+
     depth_dataset: Optional[LeRobotDataset] = None
     depth_dataset_root: Optional[Path] = None
     depth_dataset_repo_id = dataset_repo_id
@@ -3006,7 +3085,7 @@ def build_lerobot_dataset(
             depth_dataset_reopen_kwargs_by_camera[camera_key] = dict(
                 repo_id=dataset_repo_id,
                 root=str(depth_dataset_root_for_camera),
-                episodes=parsed.episodes,
+                episodes=selected_episodes,
                 download_videos=False,
                 video_backend=video_backend,
                 tolerance_s=tolerance_s,
@@ -3064,7 +3143,7 @@ def build_lerobot_dataset(
         dataset_kwargs = dict(
             repo_id=dataset_repo_id,
             root=str(dataset_root) if dataset_root else None,
-            episodes=parsed.episodes,
+            episodes=selected_episodes,
             download_videos=download_videos,
             delta_timestamps=delta_timestamps,
             video_backend=video_backend,
@@ -3088,7 +3167,7 @@ def build_lerobot_dataset(
         depth_build_kwargs = dict(
             repo_id=depth_dataset_repo_id,
             root=str(depth_dataset_root),
-            episodes=parsed.episodes,
+            episodes=selected_episodes,
             download_videos=False,
             video_backend=video_backend,
             tolerance_s=tolerance_s,
@@ -3210,7 +3289,7 @@ def build_lerobot_dataset(
         dataset_reopen_kwargs={
             "repo_id": dataset_repo_id,
             "root": str(dataset_root) if dataset_root else None,
-            "episodes": parsed.episodes,
+            "episodes": selected_episodes,
             "download_videos": download_videos,
             "delta_timestamps": delta_timestamps,
             "video_backend": video_backend,

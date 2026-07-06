@@ -198,15 +198,51 @@ class DataLoaderConfig(BaseConfig):
             max_seq_len=self.sequence_length,
             include_image=include_image
         )
-
-        dataset = get_dataset_by_name(self.dataset, self.split)
-        n_pad = 0
         if mesh is not None:
             dp_process_group = get_dp_process_group(mesh)
             dp_world_size = get_world_size(dp_process_group)
         else:
             dp_process_group = None
             dp_world_size = get_world_size()
+
+        output_shapes = preprocessor.get_output_shapes()
+        if self.kwargs_mixture or self.mixture or self.root_size_mixture:
+            datasets, rates = self._build_mixture(preprocessor)
+            if self.packing is not None:
+                raise ValueError("Eval dataloaders with mixtures do not support packing.")
+            dataset = IterableDatasetMixture(
+                start_index=self.start_index,
+                datasets=datasets,
+                mixture_rates=rates,
+                mesh=mesh,
+                seed=self.seed,
+                shuffle=self.shuffle,
+                global_batch_size=batch_size * dp_world_size,
+            )
+            sampler = None
+            n_pad = 0
+            if self.pad:
+                output_shape_str = ", ".join(f"{k}={v.shape}" for k, v in output_shapes.items())
+                log.info(f"Building eval dataset with output shapes: {output_shape_str}")
+            collator = model_config.build_collator(
+                output_shapes, self.pad, include_metadata=include_metadata)
+            if hasattr(collator, "set_packing_config"):
+                collator.set_packing_config(self.packing)
+            return DataLoader(
+                dataset,
+                batch_size=batch_size,
+                collate_fn=collator,
+                num_workers=self.num_workers,
+                worker_init_fn=_init_fn,
+                sampler=sampler,
+                pin_memory=self.pin_memory,
+                prefetch_factor=None if self.num_workers == 0 else self.prefetch_factor,
+                persistent_workers=False if self.num_workers == 0 else self.persistent_workers,
+                timeout=self.timeout,
+            )
+
+        dataset = get_dataset_by_name(self.dataset, self.split)
+        n_pad = 0
 
         if pad_batches and not self.drop_last:
             global_batch_size = batch_size * dp_world_size
@@ -231,7 +267,6 @@ class DataLoaderConfig(BaseConfig):
             ),
             dataset_name=self.dataset,
         )
-        output_shapes = preprocessor.get_output_shapes()
         if self.pad:
             output_shape_str = ", ".join(f"{k}={v.shape}" for k, v in output_shapes.items())
             log.info(f"Building eval dataset with output shapes: {output_shape_str}")

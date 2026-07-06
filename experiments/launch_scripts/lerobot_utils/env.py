@@ -101,3 +101,5 @@ def _set_lerobot_environment_from_args(args) -> None:
     os.environ["LEROBOT_RANDOM_CAMERA_ORDER"] = str(args.random_camera_order)
     os.environ["LEROBOT_USE_ANNOTATED_TASK"] = "1" if args.use_annotated_task else "0"
     os.environ["LEROBOT_SAMPLE_ANNOTATED_TASK"] = "1" if args.sample_annotated_task else "0"
+    os.environ["LEROBOT_EVAL_SPLIT"] = str(float(getattr(args, "eval_split", 0.0) or 0.0))
+    os.environ["LEROBOT_EVAL_SPLIT_SEED"] = str(int(getattr(args, "eval_split_seed", 0) or 0))
