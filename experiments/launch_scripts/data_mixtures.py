@@ -354,6 +354,28 @@ def build_molmoact2_libero_goal() -> Tuple[List[RawMixtureEntry], Dict[str, Dict
     )
 
 
+def build_molmoact2_piper_x():
+    return build_single_lerobot_mixture(
+        name="piper_x",
+        tag="piper_x",
+        repo_ids=["lerobot_test"],
+        action_key="action",
+        state_keys=["observation.state"],
+        camera_keys=[
+            "observation.images.front",
+            "observation.images.left_wrist",
+            "observation.images.right_wrist",
+        ],
+        normalize_gripper=False,
+        setup_type="dual piper-x robotic arm",
+        control_mode="absolute joint pose",
+        action_dim=14,
+        action_horizon=8,
+        n_action_steps=8
+
+    )
+
+
 def build_molmoact2_yam() -> Tuple[List[RawMixtureEntry], Dict[str, Dict[str, object]]]:
     return build_single_lerobot_mixture(
         name="yam",
@@ -396,4 +418,5 @@ MOLMOACT2_LEROBOT_MIXTURES: Dict[str, MixtureBuilder] = {
     "libero_goal": build_molmoact2_libero_goal,
     "yam": build_molmoact2_yam,
     "so100_so101": build_molmoact2_so100_so101,
+    "piper_x": build_molmoact2_piper_x,
 }
