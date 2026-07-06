@@ -2665,6 +2665,21 @@ class LeRobotDatasetWrapper(Dataset):
                 frame["task"] = annotated_task
             return frame, mapped_idx, resolved_mapped_idx, annotated_task_episode_index
         if last_error is not None:
+            if _should_skip_decode_error(last_error):
+                repo_id = self._get_repo_id()
+                raise MalformedExampleError(
+                    reason="lerobot_decode_error",
+                    details=(
+                        f"Failed to load a valid LeRobot example for repo '{repo_id}' "
+                        f"after {num_attempts} attempt(s): {last_error}"
+                    ),
+                    metadata={
+                        "dataset_name": f"lerobot:{repo_id}",
+                        "repo_id": repo_id,
+                        "requested_item": int(item),
+                        "num_attempts": int(num_attempts),
+                    },
+                ) from last_error
             raise last_error
         raise RuntimeError("Failed to load any LeRobot example.")
 
