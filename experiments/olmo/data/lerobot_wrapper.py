@@ -162,6 +162,7 @@ def _should_retry_lerobot_torchcodec_packet_error(exc: Exception) -> bool:
         or "invalid data found when processing input" in message
         or "avcodec_send_packet" in message
         or "no frame!" in message
+        or "no more frames left to decode" in message
     )
 
 
@@ -212,11 +213,11 @@ def _install_lerobot_torchcodec_retry_patch() -> None:
         frames_batch = None
         for attempt in range(2):
             decoder = decoder_cache.get_decoder(video_path)
-            metadata = decoder.metadata
-            average_fps = metadata.average_fps
-            frame_indices = [round(ts * average_fps) for ts in timestamps]
             try:
-                frames_batch = decoder.get_frames_at(indices=frame_indices)
+                # Timestamp-based lookup avoids assuming constant FPS or exact
+                # timestamp-to-frame-index alignment. Rounding timestamps by
+                # average_fps can request one frame past EOF near video ends.
+                frames_batch = decoder.get_frames_played_at(seconds=timestamps)
                 break
             except Exception as exc:
                 last_error = exc
@@ -1070,6 +1071,7 @@ def _should_skip_decode_error(exc: Exception) -> bool:
         or "invalid data found when processing input" in message
         or "avcodec_send_packet" in message
         or "no frame!" in message
+        or "no more frames left to decode" in message
     )
 
 
