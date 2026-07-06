@@ -96,6 +96,7 @@ class MolmoAct2Processor(ProcessorMixin):
             tokenizer,
             chat_template=chat_template,
         )
+        self.audio_tokenizer = None
         self.image_use_col_tokens = image_use_col_tokens
         self.use_single_crop_col_tokens = use_single_crop_col_tokens
         self.use_single_crop_start_token = use_single_crop_start_token
