@@ -475,7 +475,7 @@ class MolmoAct2(Molmo2):
                 depth_mask,
                 depth_gate,
             )
-            flow_loss, velocity = self._compute_flow_matching_loss(
+            flow_loss, action_mae, velocity = self._compute_flow_matching_loss(
                 actions=actions,
                 layer_states=selected_layer_states,
                 layer_kv_states=selected_layer_kv_states,
@@ -490,7 +490,9 @@ class MolmoAct2(Molmo2):
                 num_flow_timesteps=self.config.num_flow_timesteps,
             )
             metrics["action_flow_loss"] = flow_loss.detach()
+            metrics["action_mae"] = action_mae.detach()
             internal["action_flow_loss"] = flow_loss
+            internal["action_mae"] = action_mae
             internal["action_velocity"] = velocity
             if depth_gate is not None:
                 metrics["action_expert_depth_gate"] = self._mean_depth_gate(depth_gate).detach()
@@ -997,7 +999,7 @@ class MolmoAct2(Molmo2):
         packed_action_chunk_is_valid: Optional[torch.Tensor],
         subsegment_ids: Optional[torch.Tensor],
         num_flow_timesteps: int = 1,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         action_expert = self._require_action_expert()
         if (layer_states is None) == (layer_kv_states is None):
             raise ValueError("Provide exactly one of layer_states or layer_kv_states.")
@@ -1245,7 +1247,29 @@ class MolmoAct2(Molmo2):
                 f"actions_shape={tuple(actions.shape)}."
             )
 
-        return self._reduce_flow_matching_loss(loss, packed_action_chunk_is_valid), pred_velocity.mean(dim=1)
+        pred_actions = xt + (1.0 - t_broadcast) * pred_velocity
+        pred_actions = self._mask_action_dim_tensor(
+            pred_actions,
+            action_dim_is_pad=action_dim_is_pad,
+            enabled=self.config.mask_action_dim_padding,
+        )
+        action_mae = (pred_actions - actions_expanded).abs()
+        action_mae = self._apply_action_chunk_padding_mask(
+            action_mae,
+            action_horizon_is_pad=action_horizon_is_pad,
+            enabled=True,
+        )
+        action_mae = self._apply_action_dim_padding_mask(
+            action_mae,
+            action_dim_is_pad=action_dim_is_pad,
+            enabled=self.config.mask_action_dim_padding,
+        )
+
+        return (
+            self._reduce_flow_matching_loss(loss, packed_action_chunk_is_valid),
+            self._reduce_flow_matching_loss(action_mae, packed_action_chunk_is_valid),
+            pred_velocity.mean(dim=1),
+        )
 
     @staticmethod
     def _reduce_flow_matching_loss(
