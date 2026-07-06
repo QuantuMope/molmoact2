@@ -441,6 +441,16 @@ def main():
         metavar="BOOL",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--save_only_merged_checkpoint",
+        type=_parse_bool_arg,
+        default=False,
+        metavar="BOOL",
+        help=(
+            "If true with LoRA enabled, save only stepN-merged checkpoints for eval "
+            "and discard sharded trainer/adaptor-only checkpoint artifacts."
+        ),
+    )
     _reject_removed_action_training_flags(argv_tokens)
     args, other_args = parser.parse_known_args()
     if not 0.0 <= float(args.eval_split) < 1.0:
@@ -933,6 +943,7 @@ def main():
         eval_interval=args.eval_interval,
         save_final_unsharded_checkpoint=False,
         save_merged_lora_checkpoint=True,
+        save_only_merged_checkpoint=bool(args.save_only_merged_checkpoint),
         save_final_optim=True,
         response_logits_only=True
     )

@@ -735,6 +735,13 @@ class TrainConfig(BaseConfig):
     (`stepXXX-merged`) whenever LoRA adapters are checkpointed.
     """
 
+    save_only_merged_checkpoint: bool = False
+    """
+    When LoRA is enabled, save only the merged unsharded checkpoint for eval and
+    remove intermediate LoRA adapter directories instead of keeping sharded
+    trainer checkpoints or adapter-only checkpoints.
+    """
+
     save_interval_ephemeral: Optional[int] = None
     """
     How often (if at all) to save ephemeral sharded checkpoints. These checkpoints are the same

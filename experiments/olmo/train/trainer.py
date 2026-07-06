@@ -17,7 +17,7 @@ from datetime import timedelta
 from os.path import join
 from pathlib import Path
 from pstats import SortKey
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -1301,7 +1301,12 @@ class Trainer:
         gc_cuda()
         return checkpoint_dir
 
-    def save_lora_checkpoint(self, save_and_remove: bool = True, epoch: Optional[int] = None) -> Tuple[PathOrStr, Optional[PathOrStr]]:
+    def save_lora_checkpoint(
+        self,
+        save_and_remove: bool = True,
+        epoch: Optional[int] = None,
+        keep_lora_adapters: bool = True,
+    ) -> Tuple[PathOrStr, Optional[PathOrStr]]:
         suffix = "-lora"
         current_checkpoints = self.lora_checkpoints
         num_checkpoints_to_keep = self.cfg.save_num_checkpoints_to_keep
@@ -1317,7 +1322,7 @@ class Trainer:
         checkpoint_dir_vision = checkpoint_dir + "-vision"
 
 
-        if save_and_remove:
+        if save_and_remove and keep_lora_adapters:
             current_checkpoints.append(checkpoint_dir_llm)
             current_checkpoints.append(checkpoint_dir_vision)
 
@@ -1361,8 +1366,11 @@ class Trainer:
 
         del full_state, transformer_state, vision_state
 
-        if save_and_remove:
+        if save_and_remove and keep_lora_adapters:
             self.remove_checkpoints(current_checkpoints, num_checkpoints_to_keep * 2)
+
+        if not keep_lora_adapters:
+            self._remove_checkpoint_dirs([checkpoint_dir_llm, checkpoint_dir_vision])
         
         barrier()
         gc_cuda()
@@ -1425,9 +1433,13 @@ class Trainer:
 
     def _remove_sharded_checkpoint(self, idx: int, checkpoints: List[Path]):
         oldest_checkpoint = checkpoints.pop(idx)
+        self._remove_checkpoint_dirs([oldest_checkpoint])
+
+    def _remove_checkpoint_dirs(self, checkpoint_dirs: Sequence[PathOrStr]) -> None:
         barrier()
         if get_fs_local_rank() == 0:
-            clear_directory(oldest_checkpoint)
+            for checkpoint_dir in checkpoint_dirs:
+                clear_directory(checkpoint_dir)
         barrier()
 
     def remove_checkpoints(self, current_checkpoints, num_checkpoints_to_keep):
@@ -2579,20 +2591,31 @@ class Trainer:
                             and self.cfg.save_num_checkpoints_to_keep != 0
                         )
                     ):
-                        log.info("Saving checkpoint...")
-                        checkpoint_path = self.save_checkpoint(
-                            CheckpointType.sharded,
-                            optim=(not done_training or self.cfg.save_final_optim)
-                        )
-                        log.info(f"Checkpoint saved to {checkpoint_path}")
+                        if self.cfg.save_only_merged_checkpoint:
+                            if not self.cfg.model.lora_enable or not self.cfg.save_merged_lora_checkpoint:
+                                raise OLMoConfigurationError(
+                                    "save_only_merged_checkpoint requires LoRA training with "
+                                    "save_merged_lora_checkpoint=true."
+                                )
+                            log.info("Saving merged-only LoRA checkpoint...")
+                            lora_checkpoint_path = self.save_lora_checkpoint(keep_lora_adapters=False)
+                            self.last_sharded_checkpoint_step = self.global_step
+                            log.info(f"Merged LoRA checkpoint saved to {lora_checkpoint_path}-merged")
+                        else:
+                            log.info("Saving checkpoint...")
+                            checkpoint_path = self.save_checkpoint(
+                                CheckpointType.sharded,
+                                optim=(not done_training or self.cfg.save_final_optim)
+                            )
+                            log.info(f"Checkpoint saved to {checkpoint_path}")
 
-                        if self.cfg.model.lora_enable:
-                            log.info("Saving LoRA checkpoint...")
-                            lora_checkpoint_path = self.save_lora_checkpoint()
-                            log.info(f"LoRA checkpoint saved to {lora_checkpoint_path}-*")
+                            if self.cfg.model.lora_enable:
+                                log.info("Saving LoRA checkpoint...")
+                                lora_checkpoint_path = self.save_lora_checkpoint()
+                                log.info(f"LoRA checkpoint saved to {lora_checkpoint_path}-*")
 
-                            if self.cfg.save_merged_lora_checkpoint:
-                                log.info(f"Merged LoRA checkpoint saved to {lora_checkpoint_path}-merged")
+                                if self.cfg.save_merged_lora_checkpoint:
+                                    log.info(f"Merged LoRA checkpoint saved to {lora_checkpoint_path}-merged")
 
                         # Remove any ephemeral checkpoints.
                         self.remove_checkpoints(self.ephemeral_checkpoints, 0)
@@ -2694,18 +2717,29 @@ class Trainer:
                 self.cfg.save_num_checkpoints_to_keep != 0
                 and self.last_sharded_checkpoint_step != self.global_step
             ):
-                log.info("Saving final checkpoint...")
-                checkpoint_path = self.save_checkpoint(
-                    CheckpointType.sharded, optim=self.cfg.save_final_optim)
-                log.info(f"Checkpoint saved to {checkpoint_path}")
+                if self.cfg.save_only_merged_checkpoint:
+                    if not self.cfg.model.lora_enable or not self.cfg.save_merged_lora_checkpoint:
+                        raise OLMoConfigurationError(
+                            "save_only_merged_checkpoint requires LoRA training with "
+                            "save_merged_lora_checkpoint=true."
+                        )
+                    log.info("Saving final merged-only LoRA checkpoint...")
+                    lora_checkpoint_path = self.save_lora_checkpoint(keep_lora_adapters=False)
+                    self.last_sharded_checkpoint_step = self.global_step
+                    log.info(f"Merged LoRA checkpoint saved to {lora_checkpoint_path}-merged")
+                else:
+                    log.info("Saving final checkpoint...")
+                    checkpoint_path = self.save_checkpoint(
+                        CheckpointType.sharded, optim=self.cfg.save_final_optim)
+                    log.info(f"Checkpoint saved to {checkpoint_path}")
 
-                if self.cfg.model.lora_enable:
-                    log.info("Saving final LoRA checkpoint...")
-                    lora_checkpoint_path = self.save_lora_checkpoint()
-                    log.info(f"LoRA checkpoint saved to {lora_checkpoint_path}-*")
+                    if self.cfg.model.lora_enable:
+                        log.info("Saving final LoRA checkpoint...")
+                        lora_checkpoint_path = self.save_lora_checkpoint()
+                        log.info(f"LoRA checkpoint saved to {lora_checkpoint_path}-*")
 
-                    if self.cfg.save_merged_lora_checkpoint:
-                        log.info(f"Merged LoRA checkpoint saved to {lora_checkpoint_path}-merged")
+                        if self.cfg.save_merged_lora_checkpoint:
+                            log.info(f"Merged LoRA checkpoint saved to {lora_checkpoint_path}-merged")
 
             if self.cfg.save_final_unsharded_checkpoint:
                 log.info("Saving final unsharded checkpoint...")
