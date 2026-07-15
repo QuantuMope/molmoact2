@@ -352,7 +352,9 @@ class SIMSVSI(DatasetBase):
     def get(self, item, rng, _retry=0):
         row = self.data[item]
 
-        video_path = join(self.PATH, "data", row["video"])
+        # The parquet stores paths relative to SIMS-VSI and already includes
+        # the leading "data/" component (for example, data/videos/...).
+        video_path = join(self.PATH, row["video"])
 
         convs = row["conversations"]
         # Handle None values in conversations
