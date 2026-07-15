@@ -14,6 +14,95 @@ DEFAULT_TAG_N_ACTION_STEPS = 25
 RawMixtureEntry = Tuple[str, List[object], float]
 MixtureBuilder = Callable[[], Tuple[List[RawMixtureEntry], Dict[str, Dict[str, object]]]]
 
+MOLMO2_ER_SPATIAL_VLM_MIXTURE: List[RawMixtureEntry] = [
+    (
+        "molmo2_er_spatial_image_qa",
+        [
+            "sat",
+            ("robopoint_qa_250000", 250000),
+            ("refspatial_choice_250000", 250000),
+            ("refspatial_reasoning_250000", 250000),
+            ("vst_p_single_200000", 200000),
+            ("vsi_590k_image_200000", 200000),
+        ],
+        0.22,
+    ),
+    (
+        "molmo2_er_spatial_pointing",
+        [
+            ("robopoint_pointing_700000", 700000),
+            ("pixmo_points_150000", 150000),
+            ("refspatial_point_80000", 80000),
+        ],
+        0.22,
+    ),
+    ("molmo2_er_spatial_detection", ["robopoint_detection"], 0.02),
+    (
+        "molmo2_er_spatial_video",
+        [
+            "sims_vsi",
+            ("vsi_590k_video_300000", 300000),
+            ("robovqa_200000", 200000),
+        ],
+        0.20,
+    ),
+    (
+        "molmo2_er_spatial_multi_image",
+        [
+            ("sensenova_si_500000", 500000),
+            ("vst_p_multi_200000", 200000),
+        ],
+        0.18,
+    ),
+    (
+        "molmo2_er_abstract_reasoning",
+        [
+            ("clevr_50000", 50000),
+            ("grid3d_100000", 100000),
+        ],
+        0.08,
+    ),
+]
+
+PIPER_X_SELECTED_MOLMO2_ER_VLM_MIXTURE: List[RawMixtureEntry] = [
+    (
+        "selected_molmo2_er_spatial_image_qa",
+        [
+            "sat",
+            ("robopoint_qa_250000", 250000),
+            # ("vst_p_single_200000", 200000),
+        ],
+        0.22,
+    ),
+    (
+        "selected_molmo2_er_spatial_pointing",
+        [("robopoint_pointing_700000", 700000)],
+        0.22,
+    ),
+    ("selected_molmo2_er_spatial_detection", ["robopoint_detection"], 0.02),
+    (
+        "selected_molmo2_er_spatial_video",
+        [
+            "sims_vsi",
+            ("robovqa_200000", 200000),
+        ],
+        0.20,
+    ),
+    (
+        "selected_molmo2_er_spatial_multi_image",
+        [("vst_p_multi_200000", 200000)],
+        0.18,
+    ),
+    (
+        "selected_molmo2_er_abstract_reasoning",
+        [
+            ("clevr_50000", 50000),
+            ("grid3d_100000", 100000),
+        ],
+        0.08,
+    ),
+]
+
 
 def reset_tag_metadata() -> None:
     TAG_METADATA_BY_TAG.clear()

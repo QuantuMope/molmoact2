@@ -7,6 +7,8 @@ from typing import Dict, List, Optional, Sequence
 
 from launch_scripts.data_mixtures import (
     MOLMOACT2_LEROBOT_MIXTURES,
+    MOLMO2_ER_SPATIAL_VLM_MIXTURE,
+    PIPER_X_SELECTED_MOLMO2_ER_VLM_MIXTURE,
     TAG_METADATA_BY_TAG,
     is_lerobot_tag,
     reset_tag_metadata,
@@ -19,6 +21,9 @@ from olmo.train.trainer_config import TrainConfig
 log = logging.getLogger(__name__)
 DEFAULT_DISCRETE_ACTION_TOKENIZER = "allenai/MolmoAct2-FAST-Tokenizer"
 ACTION_TOKENIZER_MAX_ACTION_DIM = 32
+PIPER_X_MOLMO2_ER_VLM_LOADER_RATE = 0.2
+PIPER_X_MOLMO2_ER_ROBOT_COMBINED_RATE = 0.8
+PIPER_X_MOLMO2_ER_VLM_COMBINED_RATE = 0.2
 
 _REMOVED_TRAINING_ACTION_FLAGS = {
     "--action_horizon": "Use --max_action_horizon instead.",
@@ -302,12 +307,55 @@ def _build_robot_only_training_data_plan(
     )
 
 
+def _with_scaled_rates(mixture: List[KwargsMixture], scale: float) -> List[KwargsMixture]:
+    return [replace(entry, rate=float(entry.rate) * float(scale)) for entry in mixture]
+
+
+def _build_piper_x_molmo2_er_training_data_plan(
+    robot_style_mixture: Dict[str, float],
+    raw_vlm_mixture=MOLMO2_ER_SPATIAL_VLM_MIXTURE,
+    vlm_mixture_ratio: float = PIPER_X_MOLMO2_ER_VLM_COMBINED_RATE,
+) -> LeRobotTrainingDataPlan:
+    try:
+        piper_x_builder = MOLMOACT2_LEROBOT_MIXTURES["piper_x"]
+    except KeyError as exc:
+        raise NotImplementedError("The piper_x LeRobot mixture must be registered.") from exc
+
+    robot_plan = _build_robot_only_training_data_plan(
+        "piper_x",
+        piper_x_builder,
+        robot_style_mixture,
+    )
+    vlm_mixture = _build_kwargs_mixture_from_raw_mixture(raw_vlm_mixture)
+    vlm_mixture_ratio = float(vlm_mixture_ratio)
+    if vlm_mixture_ratio < 0.0 or vlm_mixture_ratio > 1.0:
+        raise ValueError(f"vlm_mixture_ratio must be in [0, 1], got {vlm_mixture_ratio}.")
+    robot_mixture_ratio = 1.0 - vlm_mixture_ratio
+    return LeRobotTrainingDataPlan(
+        combined_mixture=(
+            _with_scaled_rates(
+                robot_plan.robot_mixture,
+                robot_mixture_ratio,
+            )
+            + _with_scaled_rates(
+                vlm_mixture,
+                vlm_mixture_ratio,
+            )
+        ),
+        robot_mixture=robot_plan.robot_mixture,
+        vlm_mixture=vlm_mixture,
+        vlm_loader_rate=vlm_mixture_ratio,
+        robot_style_mixture=robot_style_mixture,
+    )
+
+
 def get_lerobot_training_data_plan(
     name: str,
     *,
     style_robot_action: float = 1.0,
     style_robot_depth: float = 0.0,
     style_robot_depth_action: float = 0.0,
+    vlm_mixture_ratio: float = PIPER_X_MOLMO2_ER_VLM_COMBINED_RATE,
 ) -> LeRobotTrainingDataPlan:
     reset_tag_metadata()
 
@@ -316,6 +364,18 @@ def get_lerobot_training_data_plan(
         "robot_depth": float(style_robot_depth),
         "robot_depth_action": float(style_robot_depth_action),
     }
+    if name == "piper_x_molmo2_er":
+        return _build_piper_x_molmo2_er_training_data_plan(
+            robot_style_mixture,
+            vlm_mixture_ratio=vlm_mixture_ratio,
+        )
+    if name == "piper_x_selected_molmo2_er":
+        return _build_piper_x_molmo2_er_training_data_plan(
+            robot_style_mixture,
+            raw_vlm_mixture=PIPER_X_SELECTED_MOLMO2_ER_VLM_MIXTURE,
+            vlm_mixture_ratio=vlm_mixture_ratio,
+        )
+
     try:
         builder = MOLMOACT2_LEROBOT_MIXTURES[name]
     except KeyError as exc:
