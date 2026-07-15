@@ -367,7 +367,7 @@ def build_molmoact2_piper_x():
             "observation.images.right_wrist",
         ],
         normalize_gripper=False,
-        setup_type="dual piper-x robotic arm",
+        setup_type="bimanual piper-x robotic arms",
         control_mode="absolute joint pose",
         action_dim=14,
         action_horizon=8,
