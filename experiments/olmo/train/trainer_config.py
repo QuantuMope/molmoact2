@@ -627,6 +627,12 @@ class TrainConfig(BaseConfig):
     Probability of drawing the next training step from ``vlm_data`` instead of ``data``.
     """
 
+    blend_vlm_and_robot_data: bool = False
+    """
+    If true, each optimizer step accumulates gradients from both the primary robot loader
+    and the dedicated VLM loader, weighted by ``vlm_loader_rate``.
+    """
+
     action_data: Optional[DataLoaderConfig] = None
     """
     Deprecated. Legacy config field for a secondary action dataloader.

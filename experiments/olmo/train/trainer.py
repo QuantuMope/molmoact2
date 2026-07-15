@@ -1773,6 +1773,7 @@ class Trainer:
         self,
         batch: Dict[str, Any],
         compute_metrics,
+        loss_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, Optional[Dict]]:
         # Split into micro-batches.
         micro_batches = self.split_batch(batch)
@@ -1941,6 +1942,9 @@ class Trainer:
 
                 del model_out
 
+                if loss_scale != 1.0:
+                    loss = loss * float(loss_scale)
+
                 # Run backward pass.
                 loss.backward()
                 total_loss += loss.detach()
@@ -1962,30 +1966,73 @@ class Trainer:
         self,
         batch: Dict[str, Any],
         compute_metrics: bool = True,
+        vlm_batch: Optional[Dict[str, Any]] = None,
+        robot_loss_weight: float = 1.0,
+        vlm_loss_weight: float = 1.0,
     ) -> Dict[str, float]:
         metrics: Dict[str, float] = {}
 
         # Zero-gradients.
         self.optim.zero_grad(set_to_none=True)
 
-        if not self.cp_enabled:
-            # Move tensors to the right device.
-            batch = self.move_to_device(batch, self.device)
+        def _run_one_batch(
+            one_batch: Dict[str, Any],
+            *,
+            loss_weight: float,
+            metric_prefix: str = "train",
+            rename_vlm: bool = False,
+        ) -> Tuple[torch.Tensor, Dict[str, float]]:
+            if not self.cp_enabled:
+                one_batch = self.move_to_device(one_batch, self.device)
 
-        # Run forward-backward pass
-        if compute_metrics:
-            self._train_metrics.reset()
-        loss = self.train_batch(batch, compute_metrics)
+            if compute_metrics:
+                self._train_metrics.reset()
+            one_loss = self.train_batch(one_batch, compute_metrics, loss_scale=loss_weight)
+
+            if torch.isnan(one_loss) or torch.isinf(one_loss):
+                raise RuntimeError(
+                    f"NaN or Inf loss detected after train_batch aggregation at "
+                    f"global_step={self.global_step}: {one_loss.item()}"
+                )
+
+            if not compute_metrics:
+                return one_loss, {}
+
+            one_metrics = {f"{metric_prefix}/{k}": v for k, v in self._train_metrics.compute().items()}
+            if rename_vlm:
+                one_metrics.pop("train/action_flow_loss", None)
+                one_metrics = rename_vlm_train_metrics(one_metrics)
+            return one_loss, one_metrics
+
+        if vlm_batch is None:
+            loss, metrics = _run_one_batch(
+                batch,
+                loss_weight=robot_loss_weight,
+                metric_prefix="train",
+            )
+        else:
+            robot_loss, metrics = _run_one_batch(
+                batch,
+                loss_weight=robot_loss_weight,
+                metric_prefix="train",
+            )
+            strip_action_supervision_from_batch(vlm_batch)
+            vlm_loss, vlm_metrics = _run_one_batch(
+                vlm_batch,
+                loss_weight=vlm_loss_weight,
+                metric_prefix="train",
+                rename_vlm=True,
+            )
+            loss = robot_loss + vlm_loss
+            metrics.update(vlm_metrics)
+            if compute_metrics:
+                metrics["batch/blend_robot_loss_weight"] = float(robot_loss_weight)
+                metrics["batch/blend_vlm_loss_weight"] = float(vlm_loss_weight)
 
         if torch.isnan(loss) or torch.isinf(loss):
             # Log the batch into a file for debugging
             # save_debug_batch(batch, self.cfg.save_folder, self.global_step, loss.item())
             raise RuntimeError(f"NaN or Inf loss detected after train_batch aggregation at global_step={self.global_step}: {loss.item()}")
-
-        if compute_metrics:
-            metrics = {f"train/{k}": v for k, v in self._train_metrics.compute().items()}
-        else:
-            metrics = {}
 
         should_log_optim_metrics_this_step = self.should_log_optim_metrics_this_step()
         if should_log_optim_metrics_this_step:
@@ -2509,37 +2556,64 @@ class Trainer:
         with torch_profiler as p:
             for epoch in range(self.epoch or 0, self.max_epochs):
                 while True:
-                    use_vlm_loader = self._should_use_vlm_loader_for_next_step()
-                    active_loader = self.vlm_loader if use_vlm_loader else self.train_loader
-                    assert active_loader is not None
-                    batch = self._get_train_batch_from_loader(active_loader, use_vlm_loader=use_vlm_loader)
-                    if use_vlm_loader:
-                        strip_action_supervision_from_batch(batch)
+                    blend_vlm_and_robot = bool(self.cfg.blend_vlm_and_robot_data)
+                    use_vlm_loader = False if blend_vlm_and_robot else self._should_use_vlm_loader_for_next_step()
+                    vlm_batch = None
+                    if blend_vlm_and_robot:
+                        if self.vlm_loader is None:
+                            raise RuntimeError("blend_vlm_and_robot_data=true requires a configured VLM loader.")
+                        batch = self._get_train_batch_from_loader(self.train_loader, use_vlm_loader=False)
+                        vlm_batch = self._get_train_batch_from_loader(self.vlm_loader, use_vlm_loader=True)
+                    else:
+                        active_loader = self.vlm_loader if use_vlm_loader else self.train_loader
+                        assert active_loader is not None
+                        batch = self._get_train_batch_from_loader(active_loader, use_vlm_loader=use_vlm_loader)
+                        if use_vlm_loader:
+                            strip_action_supervision_from_batch(batch)
 
                     # Bookkeeping.
                     batch_size, seq_len = batch["input_ids"].shape
                     global_batch_size = batch_size * self.dp_world_size  # assumes batch size equal across ranks
+                    vlm_global_batch_size = 0
+                    vlm_token_count = 0
+                    vlm_loss_token_count = 0
+                    if vlm_batch is not None:
+                        vlm_batch_size, vlm_seq_len = vlm_batch["input_ids"].shape
+                        vlm_global_batch_size = vlm_batch_size * self.dp_world_size
+                        vlm_token_count = vlm_batch_size * vlm_seq_len
+                        vlm_loss_token_count = (vlm_batch["loss_masks"] > 0).sum() / self.cp_degree
                     self.global_step += 1
                     if hasattr(self.fsdp_model, "_global_step"):
                         self.fsdp_model._global_step = self.global_step
-                    self.global_train_examples_seen_this_epoch += global_batch_size
-                    if use_vlm_loader:
+                    self.global_train_examples_seen_this_epoch += global_batch_size + vlm_global_batch_size
+                    if blend_vlm_and_robot:
+                        self.primary_train_examples_seen_this_epoch += global_batch_size
+                        self.vlm_train_examples_seen_this_epoch += vlm_global_batch_size
+                    elif use_vlm_loader:
                         self.vlm_train_examples_seen_this_epoch += global_batch_size
                     else:
                         self.primary_train_examples_seen_this_epoch += global_batch_size
-                    self.global_train_tokens_seen += global_batch_size * seq_len
+                    self.global_train_tokens_seen += global_batch_size * seq_len + vlm_global_batch_size * (
+                        0 if vlm_batch is None else vlm_batch["input_ids"].shape[1]
+                    )
 
                     speed_monitor.batch_start(
                         self.global_train_tokens_seen,
-                        (batch_size * seq_len) / self.cp_degree,  # num tokens in batch for this device
-                        (batch["loss_masks"] > 0).sum() / self.cp_degree,  # approximate num loss tokens in batch for this device
+                        ((batch_size * seq_len) + vlm_token_count) / self.cp_degree,  # num tokens in batch for this device
+                        ((batch["loss_masks"] > 0).sum() / self.cp_degree) + vlm_loss_token_count,  # approximate num loss tokens in batch for this device
                         # We start monitoring speed after the first batch since the first
                         # batch might be an outlier due to compiling and other initialization overhead.
                         record=not first_batch,
                     )
                     batch_monitor.log_batch(batch)
 
-                    if use_vlm_loader:
+                    if blend_vlm_and_robot:
+                        if self.cfg.data.packing and self.cfg.data.packing.track_packing_state:
+                            self._record_loader_worker_states(batch, use_vlm_loader=False)
+                        vlm_cfg = self.cfg.vlm_data
+                        if vlm_cfg is not None and vlm_cfg.packing and vlm_cfg.packing.track_packing_state and vlm_batch is not None:
+                            self._record_loader_worker_states(vlm_batch, use_vlm_loader=True)
+                    elif use_vlm_loader:
                         vlm_cfg = self.cfg.vlm_data
                         if vlm_cfg is not None and vlm_cfg.packing and vlm_cfg.packing.track_packing_state:
                             self._record_loader_worker_states(batch, use_vlm_loader=True)
@@ -2553,9 +2627,14 @@ class Trainer:
                         self._train_start_time = time.monotonic()
 
                     # Run train step on batch.
+                    vlm_weight = float(self.cfg.vlm_loader_rate or 0.0)
+                    robot_weight = 1.0 - vlm_weight if blend_vlm_and_robot else 1.0
                     metrics = self.train_step(
                         batch,
                         compute_metrics=should_log_this_step,
+                        vlm_batch=vlm_batch,
+                        robot_loss_weight=robot_weight,
+                        vlm_loss_weight=vlm_weight if blend_vlm_and_robot else 1.0,
                     )
 
                     # Maybe collect other metrics.
@@ -2565,7 +2644,11 @@ class Trainer:
                         metrics.update(batch_monitor.check(self.device))
                         metrics.update(lr_monitor.check())
                         metrics["batch/is_vlm_loader"] = 1.0 if use_vlm_loader else 0.0
-                        if use_vlm_loader:
+                        metrics["batch/is_blended_vlm_robot"] = 1.0 if blend_vlm_and_robot else 0.0
+                        if blend_vlm_and_robot:
+                            metrics["batch/robot_examples"] = float(global_batch_size)
+                            metrics["batch/vlm_examples"] = float(vlm_global_batch_size)
+                        elif use_vlm_loader:
                             metrics.pop("train/action_flow_loss", None)
                             metrics = rename_vlm_train_metrics(metrics)
 

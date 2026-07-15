@@ -305,6 +305,16 @@ def main():
         default=0.2,
         help="Top-level non-LeRobot VLM sampling ratio for mixtures that define VLM data.",
     )
+    parser.add_argument(
+        "--blend_vlm_and_robot_data",
+        type=_parse_bool_arg,
+        default=False,
+        metavar="BOOL",
+        help=(
+            "If true with --separate_vlm_dataloader=true, each optimizer step accumulates "
+            "one robot batch and one VLM batch weighted by --vlm_mixture_ratio."
+        ),
+    )
     parser.add_argument("--device_batch_size", default=2, type=int)
     parser.add_argument("--global_batch_size", default=128, type=int)
     parser.add_argument("--log_interval", default=20, type=int)
@@ -662,6 +672,8 @@ def main():
         tag_metadata_by_tag=TAG_METADATA_BY_TAG,
         max_action_horizon=int(args.max_action_horizon),
     )
+    if args.blend_vlm_and_robot_data and not args.separate_vlm_dataloader:
+        raise ValueError("--blend_vlm_and_robot_data=true requires --separate_vlm_dataloader=true.")
     _validate_separate_vlm_dataloader_args(args, training_data_plan)
     _set_lerobot_environment_from_args(args)
 
@@ -1016,6 +1028,7 @@ def main():
         data=primary_data_cfg,
         vlm_data=vlm_data_cfg,
         vlm_loader_rate=vlm_loader_rate,
+        blend_vlm_and_robot_data=bool(args.blend_vlm_and_robot_data),
         ft_connector=args.ft_vlm,
         ft_llm=args.ft_vlm,
         ft_vit=args.ft_vlm,

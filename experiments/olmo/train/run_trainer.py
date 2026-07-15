@@ -35,7 +35,7 @@ from olmo.torch_util import (
 )
 from olmo.dist_util import (
     parallelize_model,
-    build_world_mesh
+    build_world_mesh,
 )
 from olmo.token_layout import model_llm_token_layout
 from olmo.train.remote_filesystem import RemoteFileSystemReader
@@ -513,10 +513,37 @@ def run_trainer(cfg: TrainConfig) -> None:
         raise ValueError("Using unshuffled data for VLM training")
 
     # Construct data loader and evaluators
+    primary_global_batch_size = cfg.global_train_batch_size
+    vlm_global_batch_size = cfg.global_train_batch_size
+    if cfg.vlm_data is not None and cfg.blend_vlm_and_robot_data:
+        if cfg.vlm_loader_rate is None:
+            raise ValueError("cfg.vlm_loader_rate must be set when cfg.blend_vlm_and_robot_data=true.")
+        rate = float(cfg.vlm_loader_rate)
+        if rate <= 0.0 or rate >= 1.0:
+            raise ValueError("cfg.blend_vlm_and_robot_data=true requires 0 < cfg.vlm_loader_rate < 1.")
+        world_size = get_world_size()
+        if cfg.global_train_batch_size % world_size != 0:
+            raise ValueError(
+                f"Global batch size {cfg.global_train_batch_size} must be divisible by DP world size {world_size}."
+            )
+        total_device_examples = cfg.global_train_batch_size // world_size
+        vlm_device_examples = int(round(total_device_examples * rate))
+        vlm_device_examples = min(max(vlm_device_examples, 1), total_device_examples - 1)
+        primary_device_examples = total_device_examples - vlm_device_examples
+        primary_global_batch_size = primary_device_examples * world_size
+        vlm_global_batch_size = vlm_device_examples * world_size
+        log.info(
+            "Blending robot and VLM batches: robot_global_batch_size=%s, "
+            "vlm_global_batch_size=%s, requested_vlm_ratio=%.4f, actual_vlm_ratio=%.4f",
+            primary_global_batch_size,
+            vlm_global_batch_size,
+            rate,
+            vlm_global_batch_size / (primary_global_batch_size + vlm_global_batch_size),
+        )
     train_loader = cfg.data.build_train_dataloader(
         model_config=cfg.model,
         mesh=world_mesh,
-        global_batch_size=cfg.global_train_batch_size,
+        global_batch_size=primary_global_batch_size,
     )
     if cfg.vlm_data is not None:
         if cfg.vlm_loader_rate is None:
@@ -524,7 +551,7 @@ def run_trainer(cfg: TrainConfig) -> None:
         vlm_loader = cfg.vlm_data.build_train_dataloader(
             model_config=cfg.model,
             mesh=world_mesh,
-            global_batch_size=cfg.global_train_batch_size,
+            global_batch_size=vlm_global_batch_size,
         )
     else:
         vlm_loader = None
