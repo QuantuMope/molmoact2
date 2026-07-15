@@ -1942,11 +1942,13 @@ class Trainer:
 
                 del model_out
 
+                loss_scale = float(loss_scale)
                 if loss_scale != 1.0:
-                    loss = loss * float(loss_scale)
+                    loss = loss * loss_scale
 
                 # Run backward pass.
-                loss.backward()
+                if loss_scale != 0.0:
+                    loss.backward()
                 total_loss += loss.detach()
             except RuntimeError as exc:
                 if self._looks_like_nonfinite_error(exc):
@@ -2627,14 +2629,14 @@ class Trainer:
                         self._train_start_time = time.monotonic()
 
                     # Run train step on batch.
-                    vlm_weight = float(self.cfg.vlm_loader_rate or 0.0)
+                    vlm_weight = 0.0 if self.cfg.zero_vlm_loss else float(self.cfg.vlm_loader_rate or 0.0)
                     robot_weight = 1.0 - vlm_weight if blend_vlm_and_robot else 1.0
                     metrics = self.train_step(
                         batch,
                         compute_metrics=should_log_this_step,
                         vlm_batch=vlm_batch,
                         robot_loss_weight=robot_weight,
-                        vlm_loss_weight=vlm_weight if blend_vlm_and_robot else 1.0,
+                        vlm_loss_weight=vlm_weight if blend_vlm_and_robot else (0.0 if self.cfg.zero_vlm_loss and use_vlm_loader else 1.0),
                     )
 
                     # Maybe collect other metrics.
@@ -2645,6 +2647,7 @@ class Trainer:
                         metrics.update(lr_monitor.check())
                         metrics["batch/is_vlm_loader"] = 1.0 if use_vlm_loader else 0.0
                         metrics["batch/is_blended_vlm_robot"] = 1.0 if blend_vlm_and_robot else 0.0
+                        metrics["batch/zero_vlm_loss"] = 1.0 if self.cfg.zero_vlm_loss else 0.0
                         if blend_vlm_and_robot:
                             metrics["batch/robot_examples"] = float(global_batch_size)
                             metrics["batch/vlm_examples"] = float(vlm_global_batch_size)

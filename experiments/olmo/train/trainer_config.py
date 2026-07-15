@@ -633,6 +633,11 @@ class TrainConfig(BaseConfig):
     and the dedicated VLM loader, weighted by ``vlm_loader_rate``.
     """
 
+    zero_vlm_loss: bool = False
+    """
+    If true, VLM loader batches are forwarded for metrics but their loss is not backpropagated.
+    """
+
     action_data: Optional[DataLoaderConfig] = None
     """
     Deprecated. Legacy config field for a secondary action dataloader.

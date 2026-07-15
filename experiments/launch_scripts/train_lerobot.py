@@ -315,6 +315,16 @@ def main():
             "one robot batch and one VLM batch weighted by --vlm_mixture_ratio."
         ),
     )
+    parser.add_argument(
+        "--zero_vlm_loss",
+        type=_parse_bool_arg,
+        default=False,
+        metavar="BOOL",
+        help=(
+            "If true, forward VLM batches for metric logging but do not backpropagate their loss. "
+            "Useful for monitoring VLM degradation during action-only training."
+        ),
+    )
     parser.add_argument("--device_batch_size", default=2, type=int)
     parser.add_argument("--global_batch_size", default=128, type=int)
     parser.add_argument("--log_interval", default=20, type=int)
@@ -1030,6 +1040,7 @@ def main():
         vlm_data=vlm_data_cfg,
         vlm_loader_rate=vlm_loader_rate,
         blend_vlm_and_robot_data=bool(args.blend_vlm_and_robot_data),
+        zero_vlm_loss=bool(args.zero_vlm_loss),
         ft_connector=args.ft_vlm,
         ft_llm=args.ft_vlm,
         ft_vit=args.ft_vlm,
