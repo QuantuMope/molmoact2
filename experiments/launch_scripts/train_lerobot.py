@@ -87,6 +87,105 @@ from olmo.util import (
 
 log = logging.getLogger(__name__)
 
+_PIPER_X_JOINT_LIMIT_NORMALIZATION_MIN = [
+    -2.618,
+    0.0,
+    -2.9671,
+    -1.57,
+    -1.57,
+    -2.879793,
+    0.0,
+    -2.618,
+    0.0,
+    -2.9671,
+    -1.57,
+    -1.57,
+    -2.879793,
+    0.0,
+]
+_PIPER_X_JOINT_LIMIT_NORMALIZATION_MAX = [
+    2.618,
+    3.14,
+    0.0,
+    1.57,
+    1.57,
+    2.879793,
+    1.0,
+    2.618,
+    3.14,
+    0.0,
+    1.57,
+    1.57,
+    2.879793,
+    1.0,
+]
+
+
+def _state_stats_key_from_metadata(metadata: dict) -> str:
+    state_keys = metadata.get("state_keys")
+    if isinstance(state_keys, list) and state_keys:
+        return str(state_keys[0])
+    state_key = metadata.get("state_key")
+    if state_key:
+        return str(state_key)
+    return "observation.state"
+
+
+def _joint_limit_stats_for_tag(tag: str, metadata: dict, existing_stats: object) -> dict:
+    action_dim = int(metadata.get("action_dim") or 0)
+    setup_type = str(metadata.get("setup_type") or "").lower()
+    is_piper_x = tag == "piper_x" or ("piper" in setup_type and "x" in setup_type)
+    if not is_piper_x or action_dim != 14:
+        raise ValueError(
+            "--use_joint_lim_normalization currently supports only the piper_x 14-D "
+            f"absolute joint-pose layout; got tag={tag!r}, action_dim={action_dim}, "
+            f"setup_type={metadata.get('setup_type')!r}."
+        )
+
+    stats: dict = {}
+    if isinstance(existing_stats, dict):
+        names = existing_stats.get("names")
+        if isinstance(names, list) and len(names) == action_dim:
+            stats["names"] = list(names)
+        mask = existing_stats.get("mask")
+        if isinstance(mask, list) and len(mask) == action_dim:
+            stats["mask"] = [bool(v) for v in mask]
+        count = existing_stats.get("count")
+        if count is not None:
+            stats["count"] = count
+    stats["min"] = list(_PIPER_X_JOINT_LIMIT_NORMALIZATION_MIN)
+    stats["max"] = list(_PIPER_X_JOINT_LIMIT_NORMALIZATION_MAX)
+    return stats
+
+
+def _apply_joint_limit_normalization_stats(
+    stats_by_tag: dict,
+    tag_metadata_by_tag: dict,
+) -> None:
+    for tag, tag_stats in stats_by_tag.items():
+        metadata = dict(tag_metadata_by_tag.get(tag, {}) or {})
+        action_key = str(metadata.get("action_key") or "action")
+        state_key = _state_stats_key_from_metadata(metadata)
+
+        action_stats = tag_stats.get(action_key)
+        if action_stats is None:
+            raise ValueError(
+                f"Cannot apply --use_joint_lim_normalization for tag {tag!r}: "
+                f"missing action stats for key {action_key!r}."
+            )
+        joint_limit_stats = _joint_limit_stats_for_tag(tag, metadata, action_stats)
+        tag_stats[action_key] = dict(joint_limit_stats)
+
+        if state_key in tag_stats:
+            tag_stats[state_key] = _joint_limit_stats_for_tag(
+                tag,
+                metadata,
+                tag_stats[state_key],
+            )
+
+        metadata["joint_limit_normalization"] = True
+        tag_metadata_by_tag[tag] = metadata
+
 
 def get_model(checkpoint, model, frame_loading_backend: str = "torchcodec_exact"):
     if checkpoint == "8b":
@@ -319,6 +418,17 @@ def main():
         help="Robot state/action normalization mode. Use 'none' to disable normalization.",
     )
     parser.add_argument(
+        "--use_joint_lim_normalization",
+        type=_parse_bool_arg,
+        default=False,
+        metavar="BOOL",
+        help=(
+            "If true, normalize supported absolute joint-pose LeRobot data with fixed joint limits "
+            "instead of dataset statistics. This forces norm_mode=min_max and clips normalized "
+            "values to [-1, 1]. Currently supports the piper_x 14-D layout."
+        ),
+    )
+    parser.add_argument(
         "--action_format",
         default="continuous",
         type=str,
@@ -467,6 +577,14 @@ def main():
         raise ValueError("--eval_split_seed must be >= 0.")
     _validate_continuous_action_training_args(args.action_format)
     args.discrete_action_tokenizer = None
+    if args.use_joint_lim_normalization:
+        if args.norm_mode != "min_max":
+            log.info(
+                "--use_joint_lim_normalization=True forces --norm_mode=min_max "
+                "(received %s).",
+                args.norm_mode,
+            )
+        args.norm_mode = "min_max"
 
     explicit_max_action_dim = any(
         token == "--max_action_dim" or token.startswith("--max_action_dim=")
@@ -764,6 +882,11 @@ def main():
     )
     if stats_by_tag:
         _apply_tag_metadata_masks(
+            stats_by_tag,
+            lerobot_tag_metadata_by_tag,
+        )
+    if stats_by_tag and args.use_joint_lim_normalization:
+        _apply_joint_limit_normalization_stats(
             stats_by_tag,
             lerobot_tag_metadata_by_tag,
         )
