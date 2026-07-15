@@ -142,13 +142,19 @@ def _download_images(args):
 
 def load_external_to_internal_url_map() -> Dict[str, str]:
     logging.info("Loading external to internal url map")
-    with open(join(DATA_HOME, "pixmo_datasets", "external_to_internal_url_map.json")) as f:
+    path = join(DATA_HOME, "pixmo_datasets", "external_to_internal_url_map.json")
+    if not exists(path):
+        logging.warning("External to internal URL map not found at %s; using public image URLs", path)
+        return {}
+    with open(path) as f:
         return json.load(f)
 
 
 def add_internal_urls(dataset: datasets.Dataset, _url_map={}):
     if not _url_map:
         _url_map.update(load_external_to_internal_url_map())
+    if not _url_map:
+        return dataset
     original_size = len(dataset)
     dataset = dataset.filter(lambda x: x in _url_map, input_columns="image_url")
     if len(dataset) != original_size:

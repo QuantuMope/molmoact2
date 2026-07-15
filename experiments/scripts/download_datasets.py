@@ -2,6 +2,7 @@
 """CLI tool to download datasets training/eval data"""
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import List
@@ -23,8 +24,88 @@ def _flatten_dataset_names(names: List) -> List[str]:
     return flattened
 
 
+def _download_dataset_without_init(name: str, n_procs: int) -> bool:
+    """Download datasets whose constructors require processed files to exist."""
+    from olmo.data.dataset import DATA_HOME
+    from olmo.data.pixmo_datasets import (
+        CoSynPoint,
+        PixMoAskModelAnything,
+        PixMoCap,
+        PixMoCapQa,
+        PixMoCount,
+        PixMoMultiImageCapQa,
+        PixMoMultiPoints,
+        PixMoPoints,
+    )
+
+    if DATA_HOME:
+        os.makedirs(os.path.join(DATA_HOME, "pixmo_datasets"), exist_ok=True)
+        _download_pixmo_sidecars(name, DATA_HOME)
+
+    downloaders = {
+        "cosyn_point": CoSynPoint.download,
+        "pixmo_ask_model_anything": PixMoAskModelAnything.download,
+        "pixmo_cap": PixMoCap.download,
+        "pixmo_cap_qa": PixMoCapQa.download,
+        "pixmo_cap_qa_as_user_qa": PixMoCapQa.download,
+        "pixmo_count_train": PixMoCount.download,
+        "pixmo_multi_image_qa": PixMoMultiImageCapQa.download,
+        "pixmo_multi_image_qa_multi_only_max5": PixMoMultiImageCapQa.download,
+        "pixmo_multi_points": PixMoMultiPoints.download,
+        "pixmo_points_train": PixMoPoints.download,
+        "pixmo_points_high_freq_train": PixMoPoints.download,
+    }
+    downloader = downloaders.get(name)
+    if downloader is None:
+        return False
+    downloader(n_procs=n_procs)
+    return True
+
+
+def _download_pixmo_sidecars(name: str, data_home: str) -> None:
+    sidecars = {
+        "pixmo_multi_points": [
+            ("pixmo-multi-points-meta-filtered.json", ["allenai/pixmo-multi-points", "allenai/pixmo-points"]),
+        ],
+        "cosyn_point": [
+            ("cosyn-point-data.json", ["allenai/CoSyn-point"]),
+        ],
+    }
+    files = sidecars.get(name)
+    if not files:
+        return
+
+    from huggingface_hub import hf_hub_download
+
+    pixmo_dir = os.path.join(data_home, "pixmo_datasets")
+    for filename, repo_ids in files:
+        dst = os.path.join(pixmo_dir, filename)
+        if os.path.exists(dst):
+            continue
+
+        errors = []
+        for repo_id in repo_ids:
+            try:
+                src = hf_hub_download(repo_id=repo_id, repo_type="dataset", filename=filename)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.abspath(src) != os.path.abspath(dst):
+                    import shutil
+                    shutil.copy2(src, dst)
+                logging.info("Downloaded sidecar %s from %s to %s", filename, repo_id, dst)
+                break
+            except Exception as exc:
+                errors.append(f"{repo_id}: {exc}")
+        else:
+            raise FileNotFoundError(
+                f"Could not download required sidecar {filename}. Tried {', '.join(errors)}"
+            )
+
+
 def _download_dataset_by_name(name: str, n_procs: int) -> None:
     from olmo.data.get_dataset import get_dataset_by_name
+
+    if _download_dataset_without_init(name, n_procs=n_procs):
+        return
 
     errors = []
     for split in ("train", "validation", "test"):
