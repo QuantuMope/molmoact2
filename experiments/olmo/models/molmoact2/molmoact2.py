@@ -10,6 +10,7 @@ from typing import (
     Sequence,
     Tuple,
     Iterator,
+    Mapping,
 )
 
 import torch
@@ -475,7 +476,7 @@ class MolmoAct2(Molmo2):
                 depth_mask,
                 depth_gate,
             )
-            flow_loss, action_mae, velocity = self._compute_flow_matching_loss(
+            flow_loss, action_mae, action_unnormalized_mae, velocity = self._compute_flow_matching_loss(
                 actions=actions,
                 layer_states=selected_layer_states,
                 layer_kv_states=selected_layer_kv_states,
@@ -493,6 +494,9 @@ class MolmoAct2(Molmo2):
             metrics["action_mae"] = action_mae.detach()
             internal["action_flow_loss"] = flow_loss
             internal["action_mae"] = action_mae
+            if action_unnormalized_mae is not None:
+                metrics["action_unnormalized_mae"] = action_unnormalized_mae.detach()
+                internal["action_unnormalized_mae"] = action_unnormalized_mae
             internal["action_velocity"] = velocity
             if depth_gate is not None:
                 metrics["action_expert_depth_gate"] = self._mean_depth_gate(depth_gate).detach()
@@ -999,7 +1003,7 @@ class MolmoAct2(Molmo2):
         packed_action_chunk_is_valid: Optional[torch.Tensor],
         subsegment_ids: Optional[torch.Tensor],
         num_flow_timesteps: int = 1,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         action_expert = self._require_action_expert()
         if (layer_states is None) == (layer_kv_states is None):
             raise ValueError("Provide exactly one of layer_states or layer_kv_states.")
@@ -1253,7 +1257,8 @@ class MolmoAct2(Molmo2):
             action_dim_is_pad=action_dim_is_pad,
             enabled=self.config.mask_action_dim_padding,
         )
-        action_mae = (pred_actions - actions_expanded).abs()
+        action_abs_error = (pred_actions - actions_expanded).abs()
+        action_mae = action_abs_error
         action_mae = self._apply_action_chunk_padding_mask(
             action_mae,
             action_horizon_is_pad=action_horizon_is_pad,
@@ -1264,11 +1269,156 @@ class MolmoAct2(Molmo2):
             action_dim_is_pad=action_dim_is_pad,
             enabled=self.config.mask_action_dim_padding,
         )
+        action_unnormalized_mae = self._compute_unnormalized_action_mae(
+            pred_actions,
+            actions_expanded,
+            action_horizon_is_pad=action_horizon_is_pad,
+            action_dim_is_pad=action_dim_is_pad,
+            packed_action_chunk_is_valid=packed_action_chunk_is_valid,
+        )
 
         return (
             self._reduce_flow_matching_loss(loss, packed_action_chunk_is_valid),
             self._reduce_flow_matching_loss(action_mae, packed_action_chunk_is_valid),
+            action_unnormalized_mae,
             pred_velocity.mean(dim=1),
+        )
+
+    def _single_action_normalizer_stats(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        action_dim: int,
+    ) -> Optional[Tuple[str, Mapping, Optional[torch.Tensor]]]:
+        robot_processor = getattr(self.config, "robot_processor", None)
+        metadata_by_tag = dict(getattr(robot_processor, "metadata_by_tag", {}) or {})
+        action_stats_by_tag = [
+            metadata.get("action_stats")
+            for metadata in metadata_by_tag.values()
+            if isinstance(metadata, Mapping) and metadata.get("action_stats") is not None
+        ]
+        if len(action_stats_by_tag) != 1:
+            return None
+        stats = action_stats_by_tag[0]
+        norm_mode = str(getattr(robot_processor, "norm_mode", "min_max"))
+        if norm_mode not in {"none", "mean_std", "min_max", "q01_q99", "q10_q90"}:
+            return None
+
+        def tensor_from_stat(key: str) -> Optional[torch.Tensor]:
+            value = stats.get(key) if isinstance(stats, Mapping) else None
+            if value is None:
+                return None
+            tensor = torch.as_tensor(value, device=device, dtype=dtype).reshape(-1)
+            if tensor.numel() < action_dim:
+                return None
+            return tensor[:action_dim]
+
+        mask = tensor_from_stat("mask")
+        if mask is not None:
+            mask = mask.to(dtype=torch.bool)
+        return norm_mode, stats, mask
+
+    def _unnormalize_action_tensor(
+        self,
+        action: torch.Tensor,
+        *,
+        normalizer_stats: Tuple[str, Mapping, Optional[torch.Tensor]],
+    ) -> Optional[torch.Tensor]:
+        norm_mode, stats, mask = normalizer_stats
+        action_dim = action.shape[-1]
+        device = action.device
+        dtype = action.dtype
+
+        def tensor_from_stat(key: str) -> Optional[torch.Tensor]:
+            value = stats.get(key) if isinstance(stats, Mapping) else None
+            if value is None:
+                return None
+            tensor = torch.as_tensor(value, device=device, dtype=dtype).reshape(-1)
+            if tensor.numel() < action_dim:
+                return None
+            view_shape = [1] * action.ndim
+            view_shape[-1] = action_dim
+            return tensor[:action_dim].view(*view_shape)
+
+        bounded = norm_mode in {"min_max", "q01_q99", "q10_q90"}
+        source = action.clamp(-1.0, 1.0) if bounded else action
+        if norm_mode == "none":
+            unnormalized = source
+        elif norm_mode == "mean_std":
+            mean = tensor_from_stat("mean")
+            std = tensor_from_stat("std")
+            if mean is None or std is None:
+                return None
+            unnormalized = source * std + mean
+        elif norm_mode == "min_max":
+            min_val = tensor_from_stat("min")
+            max_val = tensor_from_stat("max")
+            if min_val is None or max_val is None:
+                return None
+            unnormalized = (source + 1.0) * (max_val - min_val) / 2.0 + min_val
+        elif norm_mode == "q01_q99":
+            q_low = tensor_from_stat("q01")
+            q_high = tensor_from_stat("q99")
+            if q_low is None or q_high is None:
+                return None
+            unnormalized = (source + 1.0) * (q_high - q_low) / 2.0 + q_low
+        elif norm_mode == "q10_q90":
+            q_low = tensor_from_stat("q10")
+            q_high = tensor_from_stat("q90")
+            if q_low is None or q_high is None:
+                return None
+            unnormalized = (source + 1.0) * (q_high - q_low) / 2.0 + q_low
+        else:
+            return None
+
+        if mask is not None:
+            view_shape = [1] * action.ndim
+            view_shape[-1] = action_dim
+            mask_view = mask.view(*view_shape)
+            unnormalized = torch.where(mask_view, unnormalized, source)
+        return unnormalized
+
+    def _compute_unnormalized_action_mae(
+        self,
+        pred_actions: torch.Tensor,
+        target_actions: torch.Tensor,
+        *,
+        action_horizon_is_pad: Optional[torch.Tensor],
+        action_dim_is_pad: Optional[torch.Tensor],
+        packed_action_chunk_is_valid: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        normalizer_stats = self._single_action_normalizer_stats(
+            device=pred_actions.device,
+            dtype=pred_actions.dtype,
+            action_dim=pred_actions.shape[-1],
+        )
+        if normalizer_stats is None:
+            return None
+        pred_raw = self._unnormalize_action_tensor(
+            pred_actions,
+            normalizer_stats=normalizer_stats,
+        )
+        target_raw = self._unnormalize_action_tensor(
+            target_actions,
+            normalizer_stats=normalizer_stats,
+        )
+        if pred_raw is None or target_raw is None:
+            return None
+        unnormalized_abs_error = (pred_raw - target_raw).abs()
+        unnormalized_abs_error = self._apply_action_chunk_padding_mask(
+            unnormalized_abs_error,
+            action_horizon_is_pad=action_horizon_is_pad,
+            enabled=True,
+        )
+        unnormalized_abs_error = self._apply_action_dim_padding_mask(
+            unnormalized_abs_error,
+            action_dim_is_pad=action_dim_is_pad,
+            enabled=self.config.mask_action_dim_padding,
+        )
+        return self._reduce_flow_matching_loss(
+            unnormalized_abs_error,
+            packed_action_chunk_is_valid,
         )
 
     @staticmethod
