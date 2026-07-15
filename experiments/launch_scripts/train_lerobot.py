@@ -299,6 +299,12 @@ def main():
         default=None,
         help="Sequence length for the dedicated VLM dataloader when --separate_vlm_dataloader=true.",
     )
+    parser.add_argument(
+        "--vlm_mixture_ratio",
+        type=float,
+        default=0.2,
+        help="Top-level non-LeRobot VLM sampling ratio for mixtures that define VLM data.",
+    )
     parser.add_argument("--device_batch_size", default=2, type=int)
     parser.add_argument("--global_batch_size", default=128, type=int)
     parser.add_argument("--log_interval", default=20, type=int)
@@ -614,6 +620,7 @@ def main():
         style_robot_action=float(args.style_robot_action),
         style_robot_depth=float(args.style_robot_depth),
         style_robot_depth_action=float(args.style_robot_depth_action),
+        vlm_mixture_ratio=float(args.vlm_mixture_ratio),
     )
     inferred_max_action_horizon = infer_max_action_horizon_from_lerobot_metadata(
         training_data_plan.robot_mixture,
