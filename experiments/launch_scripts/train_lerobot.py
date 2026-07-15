@@ -977,6 +977,7 @@ def main():
     if args.eval_split > 0.0:
         eval_data_cfg = replace(
             primary_data_cfg,
+            kwargs_mixture=training_data_plan.robot_mixture,
             shuffle=False,
             split="validation",
             drop_last=False,
