@@ -70,13 +70,18 @@ PIPER_X_SELECTED_MOLMO2_ER_VLM_MIXTURE: List[RawMixtureEntry] = [
         [
             "sat",
             ("robopoint_qa_250000", 250000),
+            ("refspatial_choice_250000", 250000),
+            ("refspatial_reasoning_250000", 250000),
             # ("vst_p_single_200000", 200000),
         ],
         0.22,
     ),
     (
         "selected_molmo2_er_spatial_pointing",
-        [("robopoint_pointing_700000", 700000)],
+        [
+            ("robopoint_pointing_700000", 700000),
+            ("refspatial_point_80000", 80000),
+        ],
         0.22,
     ),
     ("selected_molmo2_er_spatial_detection", ["robopoint_detection"], 0.02),
@@ -90,7 +95,10 @@ PIPER_X_SELECTED_MOLMO2_ER_VLM_MIXTURE: List[RawMixtureEntry] = [
     ),
     (
         "selected_molmo2_er_spatial_multi_image",
-        [("vst_p_multi_200000", 200000)],
+        [
+            ("sensenova_si_500000", 500000),
+            ("vst_p_multi_200000", 200000),
+        ],
         0.18,
     ),
     (
