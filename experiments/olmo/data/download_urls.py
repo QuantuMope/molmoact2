@@ -34,6 +34,22 @@ else:
 """Where to save downloaded images"""
 
 
+def _env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _write_pixmo_image(cache_file: str, image_bytes: bytes) -> None:
+    if _env_flag_enabled("PIXMO_NO_TMP_RENAME"):
+        with open(cache_file, 'wb') as f:
+            f.write(image_bytes)
+        return
+
+    with open(cache_file + ".tmp", 'wb') as f:
+        f.write(image_bytes)
+    rename(cache_file + ".tmp", cache_file)
+
+
 def setup_pil():
     PIL.Image.MAX_IMAGE_PIXELS = None
     ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -90,9 +106,7 @@ def _download_images(args):
         with warnings.catch_warnings(record=True) as w:
             img = PIL.Image.open(io.BytesIO(image_bytes))
             assert min(img.size) != 0
-        with open(cache_file + ".tmp", 'wb') as f:
-            f.write(image_bytes)
-        rename(cache_file + ".tmp", cache_file)
+        _write_pixmo_image(cache_file, image_bytes)
     else:
         # Create and configure session
         session = requests.Session()
@@ -117,9 +131,7 @@ def _download_images(args):
         # Else write the file bytes even though we have not confirmed the result is an image
         # Write to a tmp file and rename to ensure we don't only partially write an image if
         # we crash mid-write
-        with open(cache_file + ".tmp", 'wb') as f:
-            f.write(image_bytes)
-        rename(cache_file + ".tmp", cache_file)
+        _write_pixmo_image(cache_file, image_bytes)
 
     if check_sha:
         downloaded_hash = compute_hash(image_bytes)
