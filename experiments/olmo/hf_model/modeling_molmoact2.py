@@ -3676,6 +3676,7 @@ class MolmoAct2Model(MolmoAct2PreTrainedModel):
                 attention_mask_len, attention_mask_len, device=device, dtype=torch.bool
             )
         )[None, None, past_length:current_length, :attention_mask_len]
+        causal_mask = causal_mask.expand(batch_size, -1, -1, -1).clone()
 
         if token_type_ids is not None and past_length == 0:
             image_mask = token_type_ids.to(device=device, dtype=torch.bool)
