@@ -119,6 +119,7 @@ _PIPER_X_JOINT_LIMIT_NORMALIZATION_MAX = [
     2.879793,
     1.0,
 ]
+_PIPER_X_GRIPPER_INDICES = (6, 13)
 
 
 def _state_stats_key_from_metadata(metadata: dict) -> str:
@@ -184,6 +185,50 @@ def _apply_joint_limit_normalization_stats(
             )
 
         metadata["joint_limit_normalization"] = True
+        tag_metadata_by_tag[tag] = metadata
+
+
+def _apply_delta_action_stats(
+    stats_by_tag: dict,
+    tag_metadata_by_tag: dict,
+    delta_joint_limit: float,
+) -> None:
+    for tag, tag_stats in stats_by_tag.items():
+        metadata = dict(tag_metadata_by_tag.get(tag, {}) or {})
+        action_dim = int(metadata.get("action_dim") or 0)
+        setup_type = str(metadata.get("setup_type") or "").lower()
+        is_piper_x = tag == "piper_x" or ("piper" in setup_type and "x" in setup_type)
+        if not is_piper_x or action_dim != 14:
+            raise ValueError(
+                "--use_delta_action currently supports only the piper_x 14-D layout; "
+                f"got tag={tag!r}, action_dim={action_dim}."
+            )
+
+        action_key = str(metadata.get("action_key") or "action")
+        action_stats = dict(tag_stats[action_key])
+        arm_indices = [i for i in range(action_dim) if i not in _PIPER_X_GRIPPER_INDICES]
+        replacements = {
+            "mean": 0.0,
+            "std": delta_joint_limit,
+            "min": -delta_joint_limit,
+            "max": delta_joint_limit,
+            "q01": -delta_joint_limit,
+            "q99": delta_joint_limit,
+            "q10": -delta_joint_limit,
+            "q90": delta_joint_limit,
+        }
+        for key, replacement in replacements.items():
+            values = action_stats.get(key)
+            if isinstance(values, list) and len(values) == action_dim:
+                values = list(values)
+                for index in arm_indices:
+                    values[index] = replacement
+                action_stats[key] = values
+        tag_stats[action_key] = action_stats
+        metadata["use_delta_action"] = True
+        metadata["delta_joint_limit"] = delta_joint_limit
+        metadata["gripper_indices"] = list(_PIPER_X_GRIPPER_INDICES)
+        metadata["control_mode"] = "delta joint pose"
         tag_metadata_by_tag[tag] = metadata
 
 
@@ -381,6 +426,19 @@ def main():
         ),
     )
     parser.add_argument("--n_obs_steps", default=1, type=int)
+    parser.add_argument(
+        "--use_delta_action",
+        type=_parse_bool_arg,
+        default=False,
+        metavar="BOOL",
+        help="Train arm actions as clipped h_(i+1)-h_i joint-position deltas.",
+    )
+    parser.add_argument(
+        "--delta_joint_limit",
+        default=0.1,
+        type=float,
+        help="Per-step arm joint-position delta limit in radians.",
+    )
     parser.add_argument("--num_flow_timesteps", default=1, type=int)
     parser.add_argument("--flow_matching_beta_alpha", default=1.0, type=float)
     parser.add_argument("--flow_matching_beta_beta", default=1.5, type=float)
@@ -624,6 +682,12 @@ def main():
             )
         args.max_action_dim = int(args.legacy_action_dim)
     _validate_packed_action_chunk_padding_args(args)
+    if args.use_delta_action and args.n_obs_steps != 1:
+        raise ValueError("--use_delta_action currently requires --n_obs_steps=1.")
+    if args.use_delta_action and args.norm_mode == "none":
+        raise ValueError("--use_delta_action requires action normalization.")
+    if args.delta_joint_limit <= 0:
+        raise ValueError("--delta_joint_limit must be > 0.")
     prepare_torchrun_environment()
 
     if args.debugger:
@@ -918,6 +982,12 @@ def main():
         _apply_joint_limit_normalization_stats(
             stats_by_tag,
             lerobot_tag_metadata_by_tag,
+        )
+    if stats_by_tag and args.use_delta_action:
+        _apply_delta_action_stats(
+            stats_by_tag,
+            lerobot_tag_metadata_by_tag,
+            float(args.delta_joint_limit),
         )
     if stats_by_tag:
         _store_env_json_in_file("LEROBOT_STATS_BY_TAG", stats_by_tag)

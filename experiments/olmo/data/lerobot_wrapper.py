@@ -1261,10 +1261,12 @@ def _resolve_delta_settings(
     dataset_root: Optional[Path],
     n_obs_steps: int,
     action_horizon: int,
+    state_keys: Sequence[str] = (),
+    use_delta_action: bool = False,
 ) -> Tuple[Optional[Dict[str, List[float]]], List[int], List[int]]:
     obs_indices = list(range(1 - n_obs_steps, 1))
     action_indices = list(range(1 - n_obs_steps, 1 - n_obs_steps + action_horizon))
-    require_history = n_obs_steps > 1 or action_horizon > 1
+    require_history = n_obs_steps > 1 or action_horizon > 1 or use_delta_action
     delta_timestamps: Optional[Dict[str, List[float]]] = None
 
     if require_history:
@@ -1286,7 +1288,9 @@ def _resolve_delta_settings(
         fps = meta.fps
         timestamps: Dict[str, List[float]] = {}
         for key in meta.features:
-            if n_obs_steps > 1 and key.startswith("observation."):
+            if use_delta_action and key in state_keys:
+                timestamps[key] = [idx / fps for idx in [*action_indices, action_indices[-1] + 1]]
+            elif n_obs_steps > 1 and key.startswith("observation."):
                 timestamps[key] = [idx / fps for idx in obs_indices]
             if action_horizon > 1 and (key == "action" or key.startswith("action.")):
                 timestamps[key] = [idx / fps for idx in action_indices]
@@ -1382,6 +1386,21 @@ def _pad_action_to_max_horizon(
     return padded, action_horizon_is_pad
 
 
+def _build_delta_action(
+    state_sequence: np.ndarray,
+    absolute_action: np.ndarray,
+    delta_joint_limit: float,
+    gripper_indices: Sequence[int],
+) -> np.ndarray:
+    action = np.clip(
+        state_sequence[1:] - state_sequence[:-1],
+        -delta_joint_limit,
+        delta_joint_limit,
+    )
+    action[:, gripper_indices] = absolute_action[:, gripper_indices]
+    return action
+
+
 def _validate_depth_side_channel_length(
     values: Any,
     *,
@@ -1431,6 +1450,9 @@ class LeRobotDatasetWrapper(Dataset):
         sample_annotated_task: Optional[bool] = None,
         tag_action_horizon: int = 1,
         tag_n_action_steps: int = 1,
+        use_delta_action: bool = False,
+        delta_joint_limit: float = 0.1,
+        gripper_indices: Sequence[int] = (),
         max_action_horizon: Optional[int] = None,
         max_action_dim: Optional[int] = None,
         robot_processor: Optional[RobotProcessor] = None,
@@ -1508,6 +1530,9 @@ class LeRobotDatasetWrapper(Dataset):
             self.sample_annotated_task = False
         self.state_keys = _require_non_empty_string_sequence(state_keys, label="state_keys")
         self.action_keys = _require_non_empty_string_sequence(action_keys, label="action_keys")
+        self.use_delta_action = bool(use_delta_action)
+        self.delta_joint_limit = float(delta_joint_limit)
+        self.gripper_indices = tuple(int(index) for index in gripper_indices)
         self.style = style
         self.style_sampling_rates = _normalize_style_sampling_rates(style_sampling_rates)
         self._sampled_styles: Optional[List[str]] = None
@@ -2575,6 +2600,8 @@ class LeRobotDatasetWrapper(Dataset):
             state, _ = _extract_vector(row, self.state_keys, "observation.state.")
             if state is None:
                 return None
+            if self.use_delta_action:
+                state = state[0]
             return np.asarray(state, dtype=np.float32).reshape(-1)
 
         for ep_idx in episode_ids:
@@ -2836,6 +2863,15 @@ class LeRobotDatasetWrapper(Dataset):
             self._warned_missing_question = True
         state, action, field_metadata = self._extract_state_action(frame)
         repo_id = self._get_repo_id()
+        if self.use_delta_action:
+            state_sequence = state
+            state = state_sequence[0]
+            action = _build_delta_action(
+                state_sequence,
+                action,
+                self.delta_joint_limit,
+                self.gripper_indices,
+            )
         if normalize_state_action and self.robot_processor is not None:
             state = self.robot_processor.normalize_state(state, repo_id)
             action = self.robot_processor.normalize_action(action, repo_id)
@@ -3220,6 +3256,13 @@ def build_lerobot_dataset(
         int(tag_metadata["n_action_steps"]),
         label="tag_n_action_steps",
     )
+    use_delta_action = bool(tag_metadata.get("use_delta_action", False))
+    delta_joint_limit = float(tag_metadata.get("delta_joint_limit", 0.1))
+    gripper_indices = tuple(int(index) for index in tag_metadata.get("gripper_indices", ()))
+    state_keys = _require_non_empty_string_sequence(
+        [str(v) for v in tag_metadata["state_keys"]],
+        label="state_keys",
+    )
     if tag_n_action_steps > tag_action_horizon:
         raise ValueError(
             f"Tag metadata for repo '{metadata_repo_id}' has n_action_steps={tag_n_action_steps}, "
@@ -3236,6 +3279,8 @@ def build_lerobot_dataset(
         dataset_root,
         n_obs_steps,
         tag_action_horizon,
+        state_keys=state_keys,
+        use_delta_action=use_delta_action,
     )
 
     def _build_dataset() -> LeRobotDataset:
@@ -3333,10 +3378,6 @@ def build_lerobot_dataset(
             f"Tag metadata for repo '{parsed.repo_id}' defines camera_keys_alternative without "
             "a primary camera_keys list."
         )
-    state_keys = _require_non_empty_string_sequence(
-        [str(v) for v in tag_metadata["state_keys"]],
-        label="state_keys",
-    )
     action_keys = _require_non_empty_string_sequence(
         [str(tag_metadata["action_key"])],
         label="action_keys",
@@ -3423,6 +3464,9 @@ def build_lerobot_dataset(
         sample_annotated_task=sample_annotated_task,
         tag_action_horizon=tag_action_horizon,
         tag_n_action_steps=tag_n_action_steps,
+        use_delta_action=use_delta_action,
+        delta_joint_limit=delta_joint_limit,
+        gripper_indices=gripper_indices,
         max_action_horizon=max_action_horizon,
         max_action_dim=max_action_dim,
         robot_processor=robot_processor,
