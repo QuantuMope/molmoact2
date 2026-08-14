@@ -1,7 +1,7 @@
 import numpy as np
 
 from olmo.data import lerobot_wrapper
-from olmo.data.lerobot_wrapper import _build_delta_action
+from olmo.data.lerobot_wrapper import LeRobotDatasetWrapper, _build_delta_action
 from olmo.data.robot_processing import RobotProcessorConfig
 
 
@@ -94,3 +94,118 @@ def test_delta_action_stats_normalize_joints_and_round_trip_to_radians():
 
     np.testing.assert_allclose(normalized[0, 0], 0.5)
     np.testing.assert_allclose(restored, action)
+
+
+def test_static_filter_uses_immediate_delta_action_transition():
+    class Dataset:
+        repo_id = "lerobot_test"
+        episodes = None
+        _absolute_to_relative_idx = None
+
+        class Meta:
+            total_episodes = 1
+            episodes = [{"dataset_from_index": 0, "dataset_to_index": 3}]
+
+        meta = Meta()
+
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, index):
+            states = (
+                [[0.0], [0.0], [0.2]],
+                [[0.0], [0.2], [0.2]],
+                [[0.2], [0.2], [0.2]],
+            )
+            return {"observation.state": np.asarray(states[index], dtype=np.float32)}
+
+    wrapper = LeRobotDatasetWrapper.__new__(LeRobotDatasetWrapper)
+    wrapper.dataset = Dataset()
+    wrapper.metadata_repo_id = "lerobot_test"
+    wrapper.state_keys = ("observation.state",)
+    wrapper.use_delta_action = True
+    wrapper.tag_action_horizon = 1
+    wrapper.drop_n_last_frames = 0
+    wrapper.static_threshold = 0.1
+    wrapper._sample_indices = None
+    wrapper._episode_ranges = None
+    wrapper._episode_cumulative = None
+    wrapper._effective_len = None
+
+    wrapper._build_episode_index()
+
+    assert wrapper._sample_indices == [1]
+    np.testing.assert_array_equal(wrapper._filtered_action_indices, [1])
+    np.testing.assert_array_equal(wrapper._filtered_next_indices, [2])
+    np.testing.assert_array_equal(wrapper._filtered_action_offsets, [0])
+
+
+def test_filtered_delta_action_chunks_use_filtered_transition_order():
+    class HFDataset:
+        batch_reads = 0
+        scalar_reads = 0
+        rows = (
+            {"observation.state": np.array([0.0]), "action": np.array([0.0])},
+            {"observation.state": np.array([0.2]), "action": np.array([1.0])},
+            {"observation.state": np.array([0.2]), "action": np.array([2.0])},
+            {"observation.state": np.array([0.5]), "action": np.array([3.0])},
+        )
+
+        def select_columns(self, columns):
+            return self
+
+        def with_format(self, format):
+            return self
+
+        def __getitem__(self, index):
+            if isinstance(index, slice):
+                index = list(range(*index.indices(len(self.rows))))
+            if isinstance(index, list):
+                self.batch_reads += 1
+                return {
+                    key: np.stack([self.rows[row_index][key] for row_index in index])
+                    for key in self.rows[0]
+                }
+            self.scalar_reads += 1
+            return self.rows[index]
+
+    class Dataset:
+        repo_id = "lerobot_test"
+        episodes = None
+        _absolute_to_relative_idx = None
+        hf_dataset = HFDataset()
+
+        class Meta:
+            total_episodes = 1
+            episodes = [{"dataset_from_index": 0, "dataset_to_index": 4}]
+
+        meta = Meta()
+
+        def __len__(self):
+            return 4
+
+    wrapper = LeRobotDatasetWrapper.__new__(LeRobotDatasetWrapper)
+    wrapper.dataset = Dataset()
+    wrapper.metadata_repo_id = "lerobot_test"
+    wrapper.state_keys = ("observation.state",)
+    wrapper.action_keys = ("action",)
+    wrapper.use_delta_action = True
+    wrapper.tag_action_horizon = 2
+    wrapper.delta_joint_limit = 1.0
+    wrapper.gripper_indices = ()
+    wrapper.drop_n_last_frames = 0
+    wrapper.static_threshold = 0.1
+    wrapper._sample_indices = None
+    wrapper._episode_ranges = None
+    wrapper._episode_cumulative = None
+    wrapper._effective_len = None
+
+    wrapper._build_episode_index()
+
+    assert wrapper._sample_indices == [0]
+    np.testing.assert_array_equal(wrapper._filtered_action_indices, [0, 2])
+    np.testing.assert_array_equal(wrapper._filtered_next_indices, [1, 3])
+    np.testing.assert_array_equal(wrapper._filtered_action_offsets, [0])
+    np.testing.assert_allclose(wrapper._build_filtered_delta_action(0)[:, 0], [0.2, 0.3])
+    assert wrapper.dataset.hf_dataset.batch_reads == 2
+    assert wrapper.dataset.hf_dataset.scalar_reads == 0

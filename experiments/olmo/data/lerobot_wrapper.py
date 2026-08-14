@@ -1664,6 +1664,10 @@ class LeRobotDatasetWrapper(Dataset):
         self._episode_ranges: Optional[List[Tuple[int, int]]] = None
         self._episode_cumulative: Optional[List[int]] = None
         self._sample_indices: Optional[List[int]] = None
+        self._filtered_action_indices: Optional[np.ndarray] = None
+        self._filtered_next_indices: Optional[np.ndarray] = None
+        self._filtered_action_offsets: Optional[np.ndarray] = None
+        self._filtered_state_action_dataset = None
         self._effective_len: Optional[int] = None
         self.static_filter_total_frames = 0
         self.static_filter_static_frames = 0
@@ -1715,6 +1719,10 @@ class LeRobotDatasetWrapper(Dataset):
         self._episode_ranges = None
         self._episode_cumulative = None
         self._sample_indices = None
+        self._filtered_action_indices = None
+        self._filtered_next_indices = None
+        self._filtered_action_offsets = None
+        self._filtered_state_action_dataset = None
         self._effective_len = None
         self.static_filter_total_frames = 0
         self.static_filter_static_frames = 0
@@ -1820,6 +1828,7 @@ class LeRobotDatasetWrapper(Dataset):
             camera_key: None for camera_key in depth_reopen_by_camera
         }
         state["_action_discrete_processor"] = None
+        state["_filtered_state_action_dataset"] = None
         if not state.get("_annotated_tasks_loaded", False):
             state["_annotated_tasks_loaded"] = False
             state["_annotated_tasks_by_episode"] = None
@@ -1832,6 +1841,7 @@ class LeRobotDatasetWrapper(Dataset):
         self.__dict__.update(state)
         self.__dict__.setdefault("_depth_datasets_by_camera", {})
         self.__dict__.setdefault("_depth_dataset_reopen_kwargs_by_camera", {})
+        self.__dict__.setdefault("_filtered_state_action_dataset", None)
 
     def _get_action_discrete_processor(self):
         if self._action_discrete_processor is None:
@@ -2564,9 +2574,58 @@ class LeRobotDatasetWrapper(Dataset):
             metadata["action_keys"] = action_keys_used
         return state, action, metadata
 
+    def _build_filtered_delta_action(self, sample_index: int) -> np.ndarray:
+        offset = int(self._filtered_action_offsets[sample_index])
+        end = offset + self.tag_action_horizon
+        action_indices = self._filtered_action_indices[offset:end]
+        next_indices = self._filtered_next_indices[offset:end]
+        hf_dataset = getattr(self.dataset, "hf_dataset", None)
+
+        if hf_dataset is not None:
+            if self._filtered_state_action_dataset is None:
+                columns = list(dict.fromkeys([*self.state_keys, *self.action_keys]))
+                self._filtered_state_action_dataset = hf_dataset.select_columns(columns).with_format("numpy")
+            rows = self._filtered_state_action_dataset[
+                np.concatenate((action_indices, next_indices)).tolist()
+            ]
+            horizon = len(action_indices)
+            current_rows = {key: value[:horizon] for key, value in rows.items()}
+            next_rows = {key: value[horizon:] for key, value in rows.items()}
+            current_state, _ = _extract_vector(current_rows, self.state_keys, "observation.state.")
+            next_state, _ = _extract_vector(next_rows, self.state_keys, "observation.state.")
+            absolute_action, _ = _extract_vector(current_rows, self.action_keys, "action.")
+            current_state = np.asarray(current_state, dtype=np.float32).reshape(len(action_indices), -1)
+            next_state = np.asarray(next_state, dtype=np.float32).reshape(len(action_indices), -1)
+            absolute_action = np.asarray(absolute_action, dtype=np.float32).reshape(len(action_indices), -1)
+        else:
+            current_states = []
+            next_states = []
+            absolute_actions = []
+            for index in action_indices:
+                row = self.dataset[index]
+                state, action, _ = self._extract_state_action(row)
+                current_states.append(np.asarray(state[0], dtype=np.float32))
+                next_states.append(np.asarray(state[1], dtype=np.float32))
+                absolute_actions.append(np.asarray(action[0], dtype=np.float32))
+            current_state = np.stack(current_states)
+            next_state = np.stack(next_states)
+            absolute_action = np.stack(absolute_actions)
+
+        action = np.clip(
+            next_state - current_state,
+            -self.delta_joint_limit,
+            self.delta_joint_limit,
+        )
+        action[:, self.gripper_indices] = absolute_action[:, self.gripper_indices]
+        return action
+
     def _build_episode_index(self) -> None:
         self.static_filter_total_frames = 0
         self.static_filter_static_frames = 0
+        self._filtered_action_indices = None
+        self._filtered_next_indices = None
+        self._filtered_action_offsets = None
+        self._filtered_state_action_dataset = None
         if self.drop_n_last_frames <= 0 and self.static_threshold <= 0:
             return
         meta = getattr(self.dataset, "meta", None)
@@ -2578,10 +2637,20 @@ class LeRobotDatasetWrapper(Dataset):
             if getattr(self.dataset, "episodes", None) is not None
             else list(range(getattr(meta, "total_episodes", len(meta.episodes))))
         )
-        absolute_to_relative = getattr(self.dataset, "_absolute_to_relative_idx", None)
         hf_dataset = getattr(self.dataset, "hf_dataset", None)
+        reader = getattr(self.dataset, "reader", None)
+        absolute_to_relative = getattr(reader, "_absolute_to_relative_idx", None)
+        if absolute_to_relative is None:
+            absolute_to_relative = getattr(self.dataset, "_absolute_to_relative_idx", None)
+        state_dataset = None
+        if hf_dataset is not None and hasattr(hf_dataset, "select_columns"):
+            state_dataset = hf_dataset.select_columns(list(self.state_keys)).with_format("numpy")
         kept_indices: Optional[List[int]] = [] if self.static_threshold > 0 else None
+        filtered_action_indices: List[int] = []
+        filtered_next_indices: List[int] = []
+        filtered_action_offsets: List[int] = []
         static_filter_total = 0
+        retained_transition_count = 0
         ranges: List[Tuple[int, int]] = []
         cumulative: List[int] = []
         total = 0
@@ -2592,17 +2661,25 @@ class LeRobotDatasetWrapper(Dataset):
             rel_idx = absolute_to_relative.get(int(abs_idx))
             return None if rel_idx is None else int(rel_idx)
 
-        def raw_state_at(row_idx: int) -> Optional[np.ndarray]:
-            if hf_dataset is not None:
-                row = hf_dataset[row_idx]
-            else:
-                row = self.dataset[row_idx]
-            state, _ = _extract_vector(row, self.state_keys, "observation.state.")
-            if state is None:
-                return None
-            if self.use_delta_action:
-                state = state[0]
-            return np.asarray(state, dtype=np.float32).reshape(-1)
+        def raw_states_at(row_indices: Sequence[int]) -> np.ndarray:
+            if state_dataset is not None:
+                contiguous = row_indices[-1] - row_indices[0] + 1 == len(row_indices)
+                query = slice(row_indices[0], row_indices[-1] + 1) if contiguous else list(row_indices)
+                rows = state_dataset[query]
+                values = [
+                    np.asarray(rows[key], dtype=np.float32).reshape(len(row_indices), -1)
+                    for key in self.state_keys
+                ]
+                return np.concatenate(values, axis=-1)
+            states = []
+            for row_idx in row_indices:
+                row = hf_dataset[row_idx] if hf_dataset is not None else self.dataset[row_idx]
+                state, _ = _extract_vector(row, self.state_keys, "observation.state.")
+                state = np.asarray(state, dtype=np.float32)
+                if self.use_delta_action and state.ndim > 1:
+                    state = state[0]
+                states.append(state.reshape(-1))
+            return np.stack(states)
 
         for ep_idx in episode_ids:
             try:
@@ -2632,24 +2709,53 @@ class LeRobotDatasetWrapper(Dataset):
             if trimmed_end <= start:
                 continue
             if kept_indices is not None:
-                previous_state: Optional[np.ndarray] = None
-                episode_kept = 0
-                for abs_idx in range(start_abs, trimmed_end_abs):
-                    row_idx = map_abs_index(abs_idx)
-                    if row_idx is None:
-                        continue
-                    state = raw_state_at(row_idx)
-                    if state is None:
-                        continue
-                    static_filter_total += 1
-                    keep = previous_state is None
-                    if previous_state is not None:
-                        joint_diff = np.abs(state - previous_state)
-                        keep = bool(np.any(joint_diff > self.static_threshold, axis=-1))
-                    previous_state = state
-                    if keep:
+                state_end_abs = min(trimmed_end_abs, end_abs - 1) if self.use_delta_action else trimmed_end_abs - 1
+                state_abs_indices = list(range(start_abs, state_end_abs + 1))
+                state_row_indices = [map_abs_index(abs_idx) for abs_idx in state_abs_indices]
+                if any(row_idx is None for row_idx in state_row_indices):
+                    log.warning(
+                        "Skipping episode %s for static filtering because its frame indices are incomplete.",
+                        ep_idx,
+                    )
+                    continue
+                state_row_indices = [int(row_idx) for row_idx in state_row_indices]
+                states = raw_states_at(state_row_indices)
+                if self.use_delta_action:
+                    moving = np.any(
+                        np.abs(states[1:] - states[:-1]) > self.static_threshold,
+                        axis=-1,
+                    )
+                    transition_indices = state_row_indices[:-1]
+                    next_indices = state_row_indices[1:]
+                    static_filter_total += len(transition_indices)
+                    episode_kept_indices = [
+                        row_idx for row_idx, keep in zip(transition_indices, moving, strict=True) if keep
+                    ]
+                    episode_next_indices = [
+                        next_row_idx
+                        for next_row_idx, keep in zip(next_indices, moving, strict=True)
+                        if keep
+                    ]
+                else:
+                    moving = np.concatenate(
+                        ([True], np.any(np.abs(states[1:] - states[:-1]) > self.static_threshold, axis=-1))
+                    )
+                    static_filter_total += len(state_row_indices)
+                    episode_kept_indices = [
+                        row_idx for row_idx, keep in zip(state_row_indices, moving, strict=True) if keep
+                    ]
+                    kept_indices.extend(episode_kept_indices)
+                episode_kept = len(episode_kept_indices)
+                if self.use_delta_action and episode_kept_indices:
+                    retained_transition_count += len(episode_kept_indices)
+                    episode_offset = len(filtered_action_indices)
+                    filtered_action_indices.extend(episode_kept_indices)
+                    filtered_next_indices.extend(episode_next_indices)
+                    num_anchors = len(episode_kept_indices) - self.tag_action_horizon + 1
+                    for pos in range(max(num_anchors, 0)):
+                        row_idx = episode_kept_indices[pos]
                         kept_indices.append(row_idx)
-                        episode_kept += 1
+                        filtered_action_offsets.append(episode_offset + pos)
                 if episode_kept <= 0:
                     log.warning(
                         "Static-frame filtering removed all samples for episode %s in repo '%s'.",
@@ -2661,21 +2767,47 @@ class LeRobotDatasetWrapper(Dataset):
             ranges.append((start, trimmed_end))
             cumulative.append(total)
         if kept_indices is not None:
-            static_filter_static = max(static_filter_total - len(kept_indices), 0)
+            static_filter_static = max(
+                static_filter_total
+                - (retained_transition_count if self.use_delta_action else len(kept_indices)),
+                0,
+            )
             self.static_filter_total_frames = static_filter_total
             self.static_filter_static_frames = static_filter_static
             if kept_indices:
                 self._sample_indices = kept_indices
+                if self.use_delta_action:
+                    self._filtered_action_indices = np.asarray(filtered_action_indices, dtype=np.int64)
+                    self._filtered_next_indices = np.asarray(filtered_next_indices, dtype=np.int64)
+                    self._filtered_action_offsets = np.asarray(filtered_action_offsets, dtype=np.int64)
                 self._effective_len = len(kept_indices)
-                log.info(
-                    "LeRobot static-frame filtering for repo '%s' kept %d/%d samples with threshold=%g "
-                    "(static_ratio=%0.4f).",
-                    self._get_repo_id(),
-                    len(kept_indices),
-                    static_filter_total,
-                    self.static_threshold,
-                    (static_filter_static / static_filter_total) if static_filter_total else 0.0,
-                )
+                if self.use_delta_action:
+                    log.info(
+                        "LeRobot static-frame filtering for repo '%s' retained %d/%d transitions and "
+                        "produced %d full-horizon anchors with threshold=%g (static_ratio=%0.4f).",
+                        self._get_repo_id(),
+                        retained_transition_count,
+                        static_filter_total,
+                        len(kept_indices),
+                        self.static_threshold,
+                        (static_filter_static / static_filter_total) if static_filter_total else 0.0,
+                    )
+                else:
+                    log.info(
+                        "LeRobot static-frame filtering for repo '%s' kept %d/%d samples with threshold=%g "
+                        "(static_ratio=%0.4f).",
+                        self._get_repo_id(),
+                        len(kept_indices),
+                        static_filter_total,
+                        self.static_threshold,
+                        (static_filter_static / static_filter_total) if static_filter_total else 0.0,
+                    )
+            elif self.use_delta_action:
+                if retained_transition_count:
+                    reason = f"no episode has the required action horizon of {self.tag_action_horizon}"
+                else:
+                    reason = "no transitions exceeded the static threshold"
+                raise ValueError(f"Static filtering for repo '{self._get_repo_id()}' produced no anchors: {reason}.")
             else:
                 log.warning("static_threshold removed all samples; falling back to full dataset.")
         elif ranges:
@@ -2705,7 +2837,7 @@ class LeRobotDatasetWrapper(Dataset):
         rng: np.random.Generator,
         *,
         allow_random_retry: bool = True,
-    ) -> Tuple[Dict[str, Any], int, int, Optional[int]]:
+    ) -> Tuple[Dict[str, Any], int, int, int, Optional[int]]:
         self._ensure_dataset_loaded()
         max_retries = _get_env_int("LEROBOT_MAX_SKIP_RETRIES", 5)
         last_error: Optional[Exception] = None
@@ -2771,7 +2903,7 @@ class LeRobotDatasetWrapper(Dataset):
             if annotated_task is not None:
                 frame = dict(frame)
                 frame["task"] = annotated_task
-            return frame, mapped_idx, resolved_mapped_idx, annotated_task_episode_index
+            return frame, idx, mapped_idx, resolved_mapped_idx, annotated_task_episode_index
         if last_error is not None:
             if _should_skip_decode_error(last_error):
                 repo_id = self._get_repo_id()
@@ -2840,7 +2972,13 @@ class LeRobotDatasetWrapper(Dataset):
         normalize_state_action: bool = True,
         allow_random_retry: bool = True,
     ) -> Dict[str, Any]:
-        frame, dataset_row_index, resolved_mapped_index, annotated_task_episode_index = self._get_frame_with_retry(
+        (
+            frame,
+            sample_index,
+            dataset_row_index,
+            resolved_mapped_index,
+            annotated_task_episode_index,
+        ) = self._get_frame_with_retry(
             item,
             rng,
             allow_random_retry=allow_random_retry,
@@ -2866,12 +3004,15 @@ class LeRobotDatasetWrapper(Dataset):
         if self.use_delta_action:
             state_sequence = state
             state = state_sequence[0]
-            action = _build_delta_action(
-                state_sequence,
-                action,
-                self.delta_joint_limit,
-                self.gripper_indices,
-            )
+            if self._filtered_action_indices is not None:
+                action = self._build_filtered_delta_action(sample_index)
+            else:
+                action = _build_delta_action(
+                    state_sequence,
+                    action,
+                    self.delta_joint_limit,
+                    self.gripper_indices,
+                )
         if normalize_state_action and self.robot_processor is not None:
             state = self.robot_processor.normalize_state(state, repo_id)
             action = self.robot_processor.normalize_action(action, repo_id)
