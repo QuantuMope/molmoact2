@@ -418,6 +418,19 @@ def _normalize_registered_lerobot_tag_metadata(
     return normalized
 
 
+def _override_action_chunk_size(
+    tag_metadata_by_tag: Dict[str, Dict[str, object]],
+    action_chunk_size: Optional[int],
+) -> Dict[str, Dict[str, object]]:
+    metadata_by_tag = {tag: dict(metadata) for tag, metadata in tag_metadata_by_tag.items()}
+    if action_chunk_size is not None:
+        for tag, metadata in metadata_by_tag.items():
+            if is_lerobot_tag(tag):
+                metadata["action_horizon"] = action_chunk_size
+                metadata["n_action_steps"] = min(int(metadata["n_action_steps"]), action_chunk_size)
+    return metadata_by_tag
+
+
 def _require_tag_state_keys(tag: str, metadata: Dict[str, object]) -> List[str]:
     state_keys = metadata.get("state_keys")
     if not isinstance(state_keys, list) or not state_keys:

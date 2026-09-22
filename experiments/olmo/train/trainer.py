@@ -213,38 +213,49 @@ def lerobot_tag_sampling_rate_metrics(
     }
 
 
-def _collect_static_filter_counts(dataset: Any) -> Tuple[int, int]:
+def _collect_dataset_counts(dataset: Any, count_key: str, total_key: str) -> Tuple[int, int]:
     if dataset is None:
         return 0, 0
 
-    total = getattr(dataset, "static_filter_total_frames", None)
-    static = getattr(dataset, "static_filter_static_frames", None)
-    if total is not None and static is not None:
-        return int(static), int(total)
+    total = getattr(dataset, total_key, None)
+    count = getattr(dataset, count_key, None)
+    if total is not None and count is not None:
+        return int(count), int(total)
 
-    static_count = 0
+    count = 0
     total_count = 0
     for child in getattr(dataset, "datasets", []) or []:
-        child_static, child_total = _collect_static_filter_counts(child)
-        static_count += child_static
+        child_count, child_total = _collect_dataset_counts(child, count_key, total_key)
+        count += child_count
         total_count += child_total
 
     inner = getattr(dataset, "dataset", None)
     if inner is not None and inner is not dataset:
-        inner_static, inner_total = _collect_static_filter_counts(inner)
-        static_count += inner_static
+        inner_count, inner_total = _collect_dataset_counts(inner, count_key, total_key)
+        count += inner_count
         total_count += inner_total
 
-    return static_count, total_count
+    return count, total_count
 
 
 def static_filter_ratio_metrics(label: str, loader: Optional[DataLoader]) -> Dict[str, float]:
     if loader is None:
         return {}
-    static_count, total_count = _collect_static_filter_counts(getattr(loader, "dataset", None))
+    static_count, total_count = _collect_dataset_counts(
+        getattr(loader, "dataset", None), "static_filter_static_frames", "static_filter_total_frames",
+    )
     if total_count <= 0:
         return {}
     return {f"{label}/static_ratio": float(static_count) / float(total_count)}
+
+
+def action_clip_fraction_metrics(loader: Optional[DataLoader]) -> Dict[str, float]:
+    clipped_count, total_count = _collect_dataset_counts(
+        getattr(loader, "dataset", None), "delta_action_clipped_chunks", "delta_action_total_chunks",
+    )
+    if total_count <= 0:
+        return {}
+    return {"train/clip_fraction": float(clipped_count) / float(total_count)}
 
 
 @dataclass
@@ -2497,16 +2508,16 @@ class Trainer:
                 wandb.log(lerobot_sampling_metrics, step=0)
             self.log_metrics_to_tensorboard(lerobot_sampling_metrics, 0)
 
-        static_ratio_metrics = {}
-        static_ratio_metrics.update(static_filter_ratio_metrics("train", self.train_loader))
-        static_ratio_metrics.update(static_filter_ratio_metrics("train_vlm", self.vlm_loader))
+        dataset_metrics = action_clip_fraction_metrics(self.train_loader)
+        dataset_metrics.update(static_filter_ratio_metrics("train", self.train_loader))
+        dataset_metrics.update(static_filter_ratio_metrics("train_vlm", self.vlm_loader))
         for evaluator in self.evaluators or []:
-            static_ratio_metrics.update(static_filter_ratio_metrics(evaluator.label, evaluator.eval_loader))
-        if static_ratio_metrics:
-            self.log_metrics_to_console("LeRobot static frame ratios", static_ratio_metrics)
+            dataset_metrics.update(static_filter_ratio_metrics(evaluator.label, evaluator.eval_loader))
+        if dataset_metrics:
+            self.log_metrics_to_console("LeRobot dataset metrics", dataset_metrics)
             if wandb.run is not None:
-                wandb.log(static_ratio_metrics, step=0)
-            self.log_metrics_to_tensorboard(static_ratio_metrics, 0)
+                wandb.log(dataset_metrics, step=0)
+            self.log_metrics_to_tensorboard(dataset_metrics, 0)
 
         # Python Profiler stuff
         if self.cfg.python_profiling:

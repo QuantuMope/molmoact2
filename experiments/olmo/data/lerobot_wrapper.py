@@ -1452,6 +1452,7 @@ class LeRobotDatasetWrapper(Dataset):
         tag_n_action_steps: int = 1,
         use_delta_action: bool = False,
         delta_joint_limit: float = 0.1,
+        action_stride: int = 1,
         gripper_indices: Sequence[int] = (),
         max_action_horizon: Optional[int] = None,
         max_action_dim: Optional[int] = None,
@@ -1532,6 +1533,7 @@ class LeRobotDatasetWrapper(Dataset):
         self.action_keys = _require_non_empty_string_sequence(action_keys, label="action_keys")
         self.use_delta_action = bool(use_delta_action)
         self.delta_joint_limit = float(delta_joint_limit)
+        self.action_stride = action_stride
         self.gripper_indices = tuple(int(index) for index in gripper_indices)
         self.style = style
         self.style_sampling_rates = _normalize_style_sampling_rates(style_sampling_rates)
@@ -2576,9 +2578,10 @@ class LeRobotDatasetWrapper(Dataset):
 
     def _build_filtered_delta_action(self, sample_index: int) -> np.ndarray:
         offset = int(self._filtered_action_offsets[sample_index])
-        end = offset + self.tag_action_horizon
-        action_indices = self._filtered_action_indices[offset:end]
-        next_indices = self._filtered_next_indices[offset:end]
+        stride = max(self.action_stride, 1)
+        end = offset + self.tag_action_horizon * stride
+        action_indices = self._filtered_action_indices[offset:end:stride]
+        next_indices = self._filtered_next_indices[offset + stride - 1:end:stride]
         hf_dataset = getattr(self.dataset, "hf_dataset", None)
 
         if hf_dataset is not None:
@@ -2601,12 +2604,18 @@ class LeRobotDatasetWrapper(Dataset):
             current_states = []
             next_states = []
             absolute_actions = []
-            for index in action_indices:
+            for index, next_index in zip(action_indices, next_indices):
                 row = self.dataset[index]
                 state, action, _ = self._extract_state_action(row)
                 current_states.append(np.asarray(state[0], dtype=np.float32))
-                next_states.append(np.asarray(state[1], dtype=np.float32))
-                absolute_actions.append(np.asarray(action[0], dtype=np.float32))
+                if self.action_stride > 0:
+                    next_state, _ = _extract_vector(
+                        self.dataset[next_index], self.state_keys, "observation.state."
+                    )
+                    next_states.append(np.asarray(next_state[0], dtype=np.float32))
+                else:
+                    next_states.append(np.asarray(state[1], dtype=np.float32))
+                absolute_actions.append(np.atleast_2d(np.asarray(action, dtype=np.float32))[0])
             current_state = np.stack(current_states)
             next_state = np.stack(next_states)
             absolute_action = np.stack(absolute_actions)
@@ -2622,11 +2631,14 @@ class LeRobotDatasetWrapper(Dataset):
     def _build_episode_index(self) -> None:
         self.static_filter_total_frames = 0
         self.static_filter_static_frames = 0
+        self.delta_action_clipped_chunks = 0
+        self.delta_action_total_chunks = 0
         self._filtered_action_indices = None
         self._filtered_next_indices = None
         self._filtered_action_offsets = None
         self._filtered_state_action_dataset = None
-        if self.drop_n_last_frames <= 0 and self.static_threshold <= 0:
+        filter_transitions = self.static_threshold > 0 or (self.use_delta_action and self.action_stride > 0)
+        if self.drop_n_last_frames <= 0 and not filter_transitions:
             return
         meta = getattr(self.dataset, "meta", None)
         if meta is None or not hasattr(meta, "episodes"):
@@ -2645,7 +2657,7 @@ class LeRobotDatasetWrapper(Dataset):
         state_dataset = None
         if hf_dataset is not None and hasattr(hf_dataset, "select_columns"):
             state_dataset = hf_dataset.select_columns(list(self.state_keys)).with_format("numpy")
-        kept_indices: Optional[List[int]] = [] if self.static_threshold > 0 else None
+        kept_indices: Optional[List[int]] = [] if filter_transitions else None
         filtered_action_indices: List[int] = []
         filtered_next_indices: List[int] = []
         filtered_action_offsets: List[int] = []
@@ -2721,10 +2733,12 @@ class LeRobotDatasetWrapper(Dataset):
                 state_row_indices = [int(row_idx) for row_idx in state_row_indices]
                 states = raw_states_at(state_row_indices)
                 if self.use_delta_action:
-                    moving = np.any(
-                        np.abs(states[1:] - states[:-1]) > self.static_threshold,
-                        axis=-1,
-                    )
+                    moving = np.ones(len(states) - 1, dtype=bool)
+                    if self.static_threshold > 0:
+                        moving = np.any(
+                            np.abs(states[1:] - states[:-1]) > self.static_threshold,
+                            axis=-1,
+                        )
                     transition_indices = state_row_indices[:-1]
                     next_indices = state_row_indices[1:]
                     static_filter_total += len(transition_indices)
@@ -2750,8 +2764,27 @@ class LeRobotDatasetWrapper(Dataset):
                     retained_transition_count += len(episode_kept_indices)
                     episode_offset = len(filtered_action_indices)
                     filtered_action_indices.extend(episode_kept_indices)
+                    if self.action_stride > 0:
+                        # Compress to retained states, keeping the final transition's endpoint.
+                        episode_next_indices = episode_kept_indices[1:] + episode_next_indices[-1:]
                     filtered_next_indices.extend(episode_next_indices)
-                    num_anchors = len(episode_kept_indices) - self.tag_action_horizon + 1
+                    stride = max(self.action_stride, 1)
+                    num_anchors = len(episode_kept_indices) - self.tag_action_horizon * stride + 1
+                    if num_anchors > 0:
+                        current_states = states[:-1][moving]
+                        next_states = states[1:][moving]
+                        if self.action_stride > 0:
+                            next_states = np.concatenate((current_states[1:], next_states[-1:]))
+                        deltas = next_states[stride - 1:] - current_states[:len(current_states) - stride + 1]
+                        clipped_dims = np.abs(deltas) > self.delta_joint_limit
+                        clipped_dims[:, self.gripper_indices] = False
+                        clipped_actions = np.any(clipped_dims, axis=-1)
+                        clipped_chunks = np.zeros(num_anchors, dtype=bool)
+                        for step in range(self.tag_action_horizon):
+                            offset = step * stride
+                            clipped_chunks |= clipped_actions[offset:offset + num_anchors]
+                        self.delta_action_clipped_chunks += int(np.count_nonzero(clipped_chunks))
+                        self.delta_action_total_chunks += num_anchors
                     for pos in range(max(num_anchors, 0)):
                         row_idx = episode_kept_indices[pos]
                         kept_indices.append(row_idx)
@@ -2804,7 +2837,10 @@ class LeRobotDatasetWrapper(Dataset):
                     )
             elif self.use_delta_action:
                 if retained_transition_count:
-                    reason = f"no episode has the required action horizon of {self.tag_action_horizon}"
+                    reason = (
+                        f"no episode has the required action horizon of {self.tag_action_horizon} "
+                        f"with stride {max(self.action_stride, 1)}"
+                    )
                 else:
                     reason = "no transitions exceeded the static threshold"
                 raise ValueError(f"Static filtering for repo '{self._get_repo_id()}' produced no anchors: {reason}.")
@@ -3399,6 +3435,7 @@ def build_lerobot_dataset(
     )
     use_delta_action = bool(tag_metadata.get("use_delta_action", False))
     delta_joint_limit = float(tag_metadata.get("delta_joint_limit", 0.1))
+    action_stride = int(tag_metadata.get("action_stride", 1))
     gripper_indices = tuple(int(index) for index in tag_metadata.get("gripper_indices", ()))
     state_keys = _require_non_empty_string_sequence(
         [str(v) for v in tag_metadata["state_keys"]],
@@ -3607,6 +3644,7 @@ def build_lerobot_dataset(
         tag_n_action_steps=tag_n_action_steps,
         use_delta_action=use_delta_action,
         delta_joint_limit=delta_joint_limit,
+        action_stride=action_stride,
         gripper_indices=gripper_indices,
         max_action_horizon=max_action_horizon,
         max_action_dim=max_action_dim,

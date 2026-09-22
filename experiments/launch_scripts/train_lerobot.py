@@ -28,6 +28,7 @@ from launch_scripts.lerobot_utils.train_plan import (
     _dedupe_tokens_preserve_order,
     _parse_bool_arg,
     _normalize_registered_lerobot_tag_metadata,
+    _override_action_chunk_size,
     _normalize_style_sampling_rates,
     _reject_removed_action_training_flags,
     _validate_continuous_action_training_args,
@@ -192,6 +193,7 @@ def _apply_delta_action_stats(
     stats_by_tag: dict,
     tag_metadata_by_tag: dict,
     delta_joint_limit: float,
+    action_stride: int = 1,
 ) -> None:
     for tag, tag_stats in stats_by_tag.items():
         metadata = dict(tag_metadata_by_tag.get(tag, {}) or {})
@@ -227,6 +229,7 @@ def _apply_delta_action_stats(
         tag_stats[action_key] = action_stats
         metadata["use_delta_action"] = True
         metadata["delta_joint_limit"] = delta_joint_limit
+        metadata["action_stride"] = action_stride
         metadata["gripper_indices"] = list(_PIPER_X_GRIPPER_INDICES)
         metadata["control_mode"] = "delta joint pose"
         tag_metadata_by_tag[tag] = metadata
@@ -425,6 +428,12 @@ def main():
             "action_horizon declared by the selected LeRobot mixture metadata."
         ),
     )
+    parser.add_argument(
+        "--action_chunk_size",
+        default=None,
+        type=int,
+        help="Override the action horizon for every dataset tag and the model.",
+    )
     parser.add_argument("--n_obs_steps", default=1, type=int)
     parser.add_argument(
         "--use_delta_action",
@@ -438,6 +447,15 @@ def main():
         default=0.1,
         type=float,
         help="Per-step arm joint-position delta limit in radians.",
+    )
+    parser.add_argument(
+        "--action_stride",
+        default=1,
+        type=int,
+        help=(
+            "With --use_delta_action, advance each action by this many steps after static "
+            "filtering and clip joint deltas to --delta_joint_limit. Defaults to 1 (no skipping)."
+        ),
     )
     parser.add_argument("--num_flow_timesteps", default=1, type=int)
     parser.add_argument("--flow_matching_beta_alpha", default=1.0, type=float)
@@ -684,6 +702,8 @@ def main():
     _validate_packed_action_chunk_padding_args(args)
     if args.use_delta_action and args.n_obs_steps != 1:
         raise ValueError("--use_delta_action currently requires --n_obs_steps=1.")
+    if args.action_stride > 1 and not args.use_delta_action:
+        raise ValueError("--action_stride requires --use_delta_action=true.")
     if args.use_delta_action and args.norm_mode == "none":
         raise ValueError("--use_delta_action requires action normalization.")
     if args.delta_joint_limit <= 0:
@@ -706,13 +726,17 @@ def main():
         style_robot_depth_action=float(args.style_robot_depth_action),
         vlm_mixture_ratio=float(args.vlm_mixture_ratio),
     )
+    training_tag_metadata = _override_action_chunk_size(
+        TAG_METADATA_BY_TAG,
+        action_chunk_size=args.action_chunk_size,
+    )
     inferred_max_action_horizon = infer_max_action_horizon_from_lerobot_metadata(
         training_data_plan.robot_mixture,
-        tag_metadata_by_tag=TAG_METADATA_BY_TAG,
+        tag_metadata_by_tag=training_tag_metadata,
     )
     inferred_max_action_dim = infer_max_action_dim_from_lerobot_metadata(
         training_data_plan.robot_mixture,
-        tag_metadata_by_tag=TAG_METADATA_BY_TAG,
+        tag_metadata_by_tag=training_tag_metadata,
     )
     if args.max_action_horizon is None:
         args.max_action_horizon = inferred_max_action_horizon
@@ -743,7 +767,7 @@ def main():
         )
     _validate_lerobot_tag_temporal_metadata(
         training_data_plan.robot_mixture,
-        tag_metadata_by_tag=TAG_METADATA_BY_TAG,
+        tag_metadata_by_tag=training_tag_metadata,
         max_action_horizon=int(args.max_action_horizon),
     )
     if args.blend_vlm_and_robot_data and not args.separate_vlm_dataloader:
@@ -967,11 +991,11 @@ def main():
 
     # Preserve action normalization metadata in the saved config so inference can rebuild processors.
     root_base = os.environ.get("LEROBOT_DATA_ROOT")
-    lerobot_tag_metadata_by_tag = _normalize_registered_lerobot_tag_metadata(TAG_METADATA_BY_TAG)
+    lerobot_tag_metadata_by_tag = _normalize_registered_lerobot_tag_metadata(training_tag_metadata)
     stats_by_tag, repo_to_tag, _default_tag = _collect_tagged_stats(
         train_mixture,
         root_base=root_base,
-        tag_metadata_by_tag=TAG_METADATA_BY_TAG,
+        tag_metadata_by_tag=training_tag_metadata,
     )
     if stats_by_tag:
         _apply_tag_metadata_masks(
@@ -988,6 +1012,7 @@ def main():
             stats_by_tag,
             lerobot_tag_metadata_by_tag,
             float(args.delta_joint_limit),
+            action_stride=args.action_stride,
         )
     if stats_by_tag:
         _store_env_json_in_file("LEROBOT_STATS_BY_TAG", stats_by_tag)
