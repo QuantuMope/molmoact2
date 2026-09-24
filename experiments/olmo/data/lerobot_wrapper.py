@@ -1386,17 +1386,40 @@ def _pad_action_to_max_horizon(
     return padded, action_horizon_is_pad
 
 
+def _compute_action_delta(current: np.ndarray, following: np.ndarray, mode: str) -> np.ndarray:
+    if mode == "ee":
+        from olmo.piper_kinematics import piper_delta_ee
+
+        return piper_delta_ee(current, following)
+    return following - current
+
+
+def _action_delta_limits(
+    mode: str, delta_joint_limit: float, delta_ee_xyz_limit: float = .04, delta_ee_rpy_limit: float = .08,
+):
+    if mode == "ee":
+        from olmo.piper_kinematics import piper_ee_limits
+
+        return piper_ee_limits(delta_ee_xyz_limit, delta_ee_rpy_limit)
+    return delta_joint_limit
+
+
 def _build_delta_action(
     state_sequence: np.ndarray,
     absolute_action: np.ndarray,
     delta_joint_limit: float,
     gripper_indices: Sequence[int],
+    delta_action_mode: str = "joint",
+    delta_ee_xyz_limit: float = .04,
+    delta_ee_rpy_limit: float = .08,
 ) -> np.ndarray:
+    limit = _action_delta_limits(delta_action_mode, delta_joint_limit, delta_ee_xyz_limit, delta_ee_rpy_limit)
+    delta = _compute_action_delta(state_sequence[:-1], state_sequence[1:], delta_action_mode)
     action = np.clip(
-        state_sequence[1:] - state_sequence[:-1],
-        -delta_joint_limit,
-        delta_joint_limit,
-    )
+        delta,
+        -limit,
+        limit,
+    ).astype(delta.dtype, copy=False)
     action[:, gripper_indices] = absolute_action[:, gripper_indices]
     return action
 
@@ -1453,6 +1476,9 @@ class LeRobotDatasetWrapper(Dataset):
         use_delta_action: bool = False,
         delta_joint_limit: float = 0.1,
         action_stride: int = 1,
+        delta_action_mode: str = "joint",
+        delta_ee_xyz_limit: float = .04,
+        delta_ee_rpy_limit: float = .08,
         gripper_indices: Sequence[int] = (),
         max_action_horizon: Optional[int] = None,
         max_action_dim: Optional[int] = None,
@@ -1534,6 +1560,12 @@ class LeRobotDatasetWrapper(Dataset):
         self.use_delta_action = bool(use_delta_action)
         self.delta_joint_limit = float(delta_joint_limit)
         self.action_stride = action_stride
+        self.delta_action_mode = delta_action_mode
+        self.delta_ee_xyz_limit = delta_ee_xyz_limit
+        self.delta_ee_rpy_limit = delta_ee_rpy_limit
+        self.delta_action_limits = _action_delta_limits(
+            delta_action_mode, delta_joint_limit, delta_ee_xyz_limit, delta_ee_rpy_limit,
+        )
         self.gripper_indices = tuple(int(index) for index in gripper_indices)
         self.style = style
         self.style_sampling_rates = _normalize_style_sampling_rates(style_sampling_rates)
@@ -2582,6 +2614,7 @@ class LeRobotDatasetWrapper(Dataset):
         end = offset + self.tag_action_horizon * stride
         action_indices = self._filtered_action_indices[offset:end:stride]
         next_indices = self._filtered_next_indices[offset + stride - 1:end:stride]
+        gripper_indices = self._filtered_action_indices[offset + stride - 1:end:stride]
         hf_dataset = getattr(self.dataset, "hf_dataset", None)
 
         if hf_dataset is not None:
@@ -2589,14 +2622,15 @@ class LeRobotDatasetWrapper(Dataset):
                 columns = list(dict.fromkeys([*self.state_keys, *self.action_keys]))
                 self._filtered_state_action_dataset = hf_dataset.select_columns(columns).with_format("numpy")
             rows = self._filtered_state_action_dataset[
-                np.concatenate((action_indices, next_indices)).tolist()
+                np.concatenate((action_indices, next_indices, gripper_indices)).tolist()
             ]
             horizon = len(action_indices)
             current_rows = {key: value[:horizon] for key, value in rows.items()}
-            next_rows = {key: value[horizon:] for key, value in rows.items()}
+            next_rows = {key: value[horizon:2 * horizon] for key, value in rows.items()}
+            gripper_rows = {key: value[2 * horizon:] for key, value in rows.items()}
             current_state, _ = _extract_vector(current_rows, self.state_keys, "observation.state.")
             next_state, _ = _extract_vector(next_rows, self.state_keys, "observation.state.")
-            absolute_action, _ = _extract_vector(current_rows, self.action_keys, "action.")
+            absolute_action, _ = _extract_vector(gripper_rows, self.action_keys, "action.")
             current_state = np.asarray(current_state, dtype=np.float32).reshape(len(action_indices), -1)
             next_state = np.asarray(next_state, dtype=np.float32).reshape(len(action_indices), -1)
             absolute_action = np.asarray(absolute_action, dtype=np.float32).reshape(len(action_indices), -1)
@@ -2604,7 +2638,7 @@ class LeRobotDatasetWrapper(Dataset):
             current_states = []
             next_states = []
             absolute_actions = []
-            for index, next_index in zip(action_indices, next_indices):
+            for index, next_index, gripper_index in zip(action_indices, next_indices, gripper_indices):
                 row = self.dataset[index]
                 state, action, _ = self._extract_state_action(row)
                 current_states.append(np.asarray(state[0], dtype=np.float32))
@@ -2615,16 +2649,17 @@ class LeRobotDatasetWrapper(Dataset):
                     next_states.append(np.asarray(next_state[0], dtype=np.float32))
                 else:
                     next_states.append(np.asarray(state[1], dtype=np.float32))
+                if gripper_index != index:
+                    action, _ = _extract_vector(self.dataset[gripper_index], self.action_keys, "action.")
                 absolute_actions.append(np.atleast_2d(np.asarray(action, dtype=np.float32))[0])
             current_state = np.stack(current_states)
             next_state = np.stack(next_states)
             absolute_action = np.stack(absolute_actions)
 
+        limit = self.delta_action_limits
         action = np.clip(
-            next_state - current_state,
-            -self.delta_joint_limit,
-            self.delta_joint_limit,
-        )
+            _compute_action_delta(current_state, next_state, self.delta_action_mode), -limit, limit,
+        ).astype(np.float32)
         action[:, self.gripper_indices] = absolute_action[:, self.gripper_indices]
         return action
 
@@ -2633,11 +2668,27 @@ class LeRobotDatasetWrapper(Dataset):
         self.static_filter_static_frames = 0
         self.delta_action_clipped_chunks = 0
         self.delta_action_total_chunks = 0
+        self.delta_action_clipped_actions = 0
+        self.delta_action_total_actions = 0
+        self.delta_ee_statistics = {
+            "count": 0,
+            "sum": np.zeros(6),
+            "sum_sq": np.zeros(6),
+            "abs_max": np.zeros(6),
+        }
+        self.delta_joint_statistics = {
+            "count": 0,
+            "sum": np.zeros(12),
+            "sum_sq": np.zeros(12),
+            "abs_max": np.zeros(12),
+        }
         self._filtered_action_indices = None
         self._filtered_next_indices = None
         self._filtered_action_offsets = None
         self._filtered_state_action_dataset = None
-        filter_transitions = self.static_threshold > 0 or (self.use_delta_action and self.action_stride > 0)
+        filter_transitions = self.static_threshold > 0 or (
+            self.use_delta_action and (self.action_stride > 0 or self.delta_action_mode == "ee")
+        )
         if self.drop_n_last_frames <= 0 and not filter_transitions:
             return
         meta = getattr(self.dataset, "meta", None)
@@ -2775,16 +2826,42 @@ class LeRobotDatasetWrapper(Dataset):
                         next_states = states[1:][moving]
                         if self.action_stride > 0:
                             next_states = np.concatenate((current_states[1:], next_states[-1:]))
-                        deltas = next_states[stride - 1:] - current_states[:len(current_states) - stride + 1]
-                        clipped_dims = np.abs(deltas) > self.delta_joint_limit
+                        deltas = _compute_action_delta(
+                            current_states[:len(current_states) - stride + 1],
+                            next_states[stride - 1:],
+                            self.delta_action_mode,
+                        )
+                        limit = self.delta_action_limits
+                        clipped_dims = np.abs(deltas) > limit
                         clipped_dims[:, self.gripper_indices] = False
                         clipped_actions = np.any(clipped_dims, axis=-1)
                         clipped_chunks = np.zeros(num_anchors, dtype=bool)
                         for step in range(self.tag_action_horizon):
                             offset = step * stride
                             clipped_chunks |= clipped_actions[offset:offset + num_anchors]
+                            self.delta_action_clipped_actions += int(
+                                np.count_nonzero(clipped_actions[offset:offset + num_anchors])
+                            )
+                            if self.delta_action_mode == "ee":
+                                # Raw SI-unit targets, weighted by occurrence in training chunks.
+                                ee = deltas[offset:offset + num_anchors].reshape(-1, 7)[:, :6].astype(np.float64)
+                                stats = self.delta_ee_statistics
+                                stats["count"] += len(ee)
+                                stats["sum"] += ee.sum(axis=0)
+                                stats["sum_sq"] += np.square(ee).sum(axis=0)
+                                stats["abs_max"] = np.maximum(stats["abs_max"], np.abs(ee).max(axis=0))
+                                joint_delta = (
+                                    next_states[offset + stride - 1:offset + stride - 1 + num_anchors]
+                                    - current_states[offset:offset + num_anchors]
+                                ).reshape(-1, 2, 7)[..., :6].reshape(-1, 12).astype(np.float64)
+                                stats = self.delta_joint_statistics
+                                stats["count"] += len(joint_delta)
+                                stats["sum"] += joint_delta.sum(axis=0)
+                                stats["sum_sq"] += np.square(joint_delta).sum(axis=0)
+                                stats["abs_max"] = np.maximum(stats["abs_max"], np.abs(joint_delta).max(axis=0))
                         self.delta_action_clipped_chunks += int(np.count_nonzero(clipped_chunks))
                         self.delta_action_total_chunks += num_anchors
+                        self.delta_action_total_actions += num_anchors * self.tag_action_horizon
                     for pos in range(max(num_anchors, 0)):
                         row_idx = episode_kept_indices[pos]
                         kept_indices.append(row_idx)
@@ -3048,6 +3125,9 @@ class LeRobotDatasetWrapper(Dataset):
                     action,
                     self.delta_joint_limit,
                     self.gripper_indices,
+                    self.delta_action_mode,
+                    self.delta_ee_xyz_limit,
+                    self.delta_ee_rpy_limit,
                 )
         if normalize_state_action and self.robot_processor is not None:
             state = self.robot_processor.normalize_state(state, repo_id)
@@ -3436,6 +3516,9 @@ def build_lerobot_dataset(
     use_delta_action = bool(tag_metadata.get("use_delta_action", False))
     delta_joint_limit = float(tag_metadata.get("delta_joint_limit", 0.1))
     action_stride = int(tag_metadata.get("action_stride", 1))
+    delta_action_mode = str(tag_metadata.get("delta_action_mode", "joint"))
+    delta_ee_xyz_limit = float(tag_metadata.get("delta_ee_xyz_limit", .04))
+    delta_ee_rpy_limit = float(tag_metadata.get("delta_ee_rpy_limit", .08))
     gripper_indices = tuple(int(index) for index in tag_metadata.get("gripper_indices", ()))
     state_keys = _require_non_empty_string_sequence(
         [str(v) for v in tag_metadata["state_keys"]],
@@ -3645,6 +3728,9 @@ def build_lerobot_dataset(
         use_delta_action=use_delta_action,
         delta_joint_limit=delta_joint_limit,
         action_stride=action_stride,
+        delta_action_mode=delta_action_mode,
+        delta_ee_xyz_limit=delta_ee_xyz_limit,
+        delta_ee_rpy_limit=delta_ee_rpy_limit,
         gripper_indices=gripper_indices,
         max_action_horizon=max_action_horizon,
         max_action_dim=max_action_dim,

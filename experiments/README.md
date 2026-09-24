@@ -36,6 +36,43 @@ export HF_ACCESS_TOKEN="${HF_ACCESS_TOKEN:-}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 ```
 
+## Piper-X delta actions
+
+For `piper_x`, `--use_delta_action=true` supports `--delta_action_mode=joint`
+(default) or `--delta_action_mode=ee`. Both filter transitions using raw joint
+displacement (`--static_threshold`) before applying `--action_stride`. Set
+`--action_chunk_size` to override the dataset's action horizon.
+Each strided action uses the absolute gripper command from the last retained
+transition in that stride: stride 4 pairs `q[4] - q[0]` with `gripper_action[3]`.
+This applies to both joint and EE modes; stride 1 is unchanged.
+
+EE mode uses kincpp batched FK for the Piper TCP defined in `olmo/piper_kinematics.py`.
+Each arm contributes `[dx, dy, dz, droll, dpitch, dyaw, absolute_gripper]`;
+observations remain joint positions. Translation deltas are in each arm's base
+frame. Rotation labels invert `R_next = Rx(droll) Ry(dpitch) Rz(dyaw) R_current`,
+matching ren_openpi0's simulation controller (intrinsic `XYZ`, not the real
+plugin's extrinsic `xyz`).
+
+EE components are clipped per axis to `--delta_ee_xyz_limit` (default 0.04 metres)
+and `--delta_ee_rpy_limit` (default 0.08 radians), and normalized using those bounds.
+`--delta_joint_limit` is ignored in EE mode. The existing absolute
+gripper targets and normalization are preserved. Inference must use the same
+base-frame EE convention and an EE-to-joint controller, not a joint-delta controller.
+
+At step 0, `train/clip_fraction` reports the fraction of chunks with any clipped
+non-gripper component. `train/action_clip_fraction` reports the fraction of individual
+action steps with any clipped non-gripper component, counting each occurrence in
+valid training chunks (including overlapping chunks). Both apply to joint and EE modes.
+`train/delta_ee/{x,y,z,roll,pitch,yaw}/{mean,std,abs_max}`
+reports raw, pre-clipping statistics in metres/radians, pooled over both arms
+and weighted by each action's occurrence in the training chunks.
+
+EE mode also reports `train/delta_joint/dim_{i}/{mean,std,abs_max}` for original
+state dimensions 0–5 and 7–12 (the twelve arm joints, excluding grippers).
+These are raw recorded joint displacements in radians after static filtering and
+striding, weighted by occurrence in valid chunks, not IK results from clipped EE
+actions. The two arms are kept separate, and these summaries are logged at step 0.
+
 ## Checkpoints
 
 `launch_scripts/train_lerobot.py` accepts local checkpoint paths, URLs, and Hugging Face model IDs.

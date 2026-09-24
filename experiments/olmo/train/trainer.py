@@ -250,12 +250,54 @@ def static_filter_ratio_metrics(label: str, loader: Optional[DataLoader]) -> Dic
 
 
 def action_clip_fraction_metrics(loader: Optional[DataLoader]) -> Dict[str, float]:
-    clipped_count, total_count = _collect_dataset_counts(
-        getattr(loader, "dataset", None), "delta_action_clipped_chunks", "delta_action_total_chunks",
-    )
-    if total_count <= 0:
+    metrics = {}
+    for unit, name in (("chunks", "clip_fraction"), ("actions", "action_clip_fraction")):
+        clipped_count, total_count = _collect_dataset_counts(
+            getattr(loader, "dataset", None), f"delta_action_clipped_{unit}", f"delta_action_total_{unit}",
+        )
+        if total_count > 0:
+            metrics[f"train/{name}"] = float(clipped_count) / float(total_count)
+    return metrics
+
+
+def _collect_delta_statistics(dataset: Any, attribute: str, num_dims: int) -> Dict[str, Any]:
+    stats = getattr(dataset, attribute, None)
+    if stats is not None:
+        return stats
+    total = {"count": 0, "sum": np.zeros(num_dims), "sum_sq": np.zeros(num_dims), "abs_max": np.zeros(num_dims)}
+    children = list(getattr(dataset, "datasets", []) or [])
+    inner = getattr(dataset, "dataset", None)
+    if inner is not None and inner is not dataset:
+        children.append(inner)
+    for child in children:
+        child_stats = _collect_delta_statistics(child, attribute, num_dims)
+        for key in ("count", "sum", "sum_sq"):
+            total[key] += child_stats[key]
+        total["abs_max"] = np.maximum(total["abs_max"], child_stats["abs_max"])
+    return total
+
+
+def _delta_statistics_metrics(loader: Optional[DataLoader], kind: str, axes: Sequence[str]) -> Dict[str, float]:
+    stats = _collect_delta_statistics(getattr(loader, "dataset", None), f"{kind}_statistics", len(axes))
+    if stats["count"] == 0:
         return {}
-    return {"train/clip_fraction": float(clipped_count) / float(total_count)}
+    mean = stats["sum"] / stats["count"]
+    std = np.sqrt(np.maximum(stats["sum_sq"] / stats["count"] - np.square(mean), 0))
+    metrics = {}
+    for index, axis in enumerate(axes):
+        for name, values in (("mean", mean), ("std", std), ("abs_max", stats["abs_max"])):
+            metrics[f"train/{kind}/{axis}/{name}"] = float(values[index])
+    return metrics
+
+
+def delta_ee_statistics_metrics(loader: Optional[DataLoader]) -> Dict[str, float]:
+    """Pre-clipping SI-unit statistics, pooled over both arms and training chunks."""
+    return _delta_statistics_metrics(loader, "delta_ee", ("x", "y", "z", "roll", "pitch", "yaw"))
+
+
+def delta_joint_statistics_metrics(loader: Optional[DataLoader]) -> Dict[str, float]:
+    """Raw joint deltas in EE mode, keeping the two arms separate and excluding grippers."""
+    return _delta_statistics_metrics(loader, "delta_joint", [f"dim_{i}" for i in (*range(6), *range(7, 13))])
 
 
 @dataclass
@@ -2509,6 +2551,8 @@ class Trainer:
             self.log_metrics_to_tensorboard(lerobot_sampling_metrics, 0)
 
         dataset_metrics = action_clip_fraction_metrics(self.train_loader)
+        dataset_metrics.update(delta_ee_statistics_metrics(self.train_loader))
+        dataset_metrics.update(delta_joint_statistics_metrics(self.train_loader))
         dataset_metrics.update(static_filter_ratio_metrics("train", self.train_loader))
         dataset_metrics.update(static_filter_ratio_metrics("train_vlm", self.vlm_loader))
         for evaluator in self.evaluators or []:

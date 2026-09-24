@@ -88,8 +88,12 @@ def test_action_chunk_size_overrides_mixture_horizons_without_mutating_registry(
 
 
 @pytest.mark.parametrize("chunk_size, action_stride", [(None, 1), (1, 2), (64, 3)])
-def test_launcher_parses_action_chunk_and_stride(monkeypatch, chunk_size, action_stride):
+@pytest.mark.parametrize("delta_action_mode", ["joint", "ee"])
+def test_launcher_parses_action_chunk_and_stride(monkeypatch, chunk_size, action_stride, delta_action_mode):
     argv = ["train_lerobot.py", "8b", "piper_x", "--use_delta_action=true"]
+    if delta_action_mode == "ee":
+        argv.extend(["--delta_action_mode=ee", "--delta_joint_limit=-1",
+                     "--delta_ee_xyz_limit=0.02", "--delta_ee_rpy_limit=0.06"])
     if chunk_size is not None:
         argv.extend([f"--action_chunk_size={chunk_size}", f"--action_stride={action_stride}"])
     monkeypatch.setattr("sys.argv", argv)
@@ -113,6 +117,9 @@ def test_launcher_parses_action_chunk_and_stride(monkeypatch, chunk_size, action
     )
     assert captured["action_chunk_size"] == chunk_size
     assert captured["action_stride"] == action_stride
+    assert captured["delta_action_mode"] == delta_action_mode
+    assert captured["delta_ee_xyz_limit"] == (.02 if delta_action_mode == "ee" else .04)
+    assert captured["delta_ee_rpy_limit"] == (.06 if delta_action_mode == "ee" else .08)
     assert captured["max_action_horizon"] == expected_horizon
 
 

@@ -1,0 +1,61 @@
+"""Piper-X TCP kinematics and base-frame EE deltas (metres and radians)."""
+
+from functools import lru_cache
+
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+
+# Home TCP relative to each arm base, with a 0.13503 m offset along link6 +Z.
+# TCP axes (+X, +Y, +Z) correspond to link6 (+Z, -X, -Y).
+PIPER_M = np.array([
+    [0.995687218, -0.000003846, -0.092773725, 0.232276698],
+    [0.000004475, 1.000000000, 0.000006569, 0.000001714],
+    [0.092773725, -0.000006956, 0.995687218, 0.229485257],
+    [0.0, 0.0, 0.0, 1.0],
+])
+PIPER_S = np.array([
+    [0., -0.000007844, -0.000007844, -0.000007844, 0.092770068, 0.995687218],
+    [0., 1.000000000, 1.000000000, 1.000000000, -0.000006569, 0.000004475],
+    [1., -0.000003639, -0.000003639, -0.000003639, -0.995687559, 0.092773725],
+    [0., -0.123000000, -0.161605158, -0.207202299, 0.000000583, -0.000000868],
+    [0., -0.000000965, -0.000002295, -0.000001675, 0.082534381, 0.206946363],
+    [0., 0.000000000, -0.282403510, -0.013603454, -0.000000490, -0.000000667],
+])
+PIPER_JOINT_LOWER = np.array([-2.618, 0., -2.9671, -1.57, -1.57, -2.879793])
+PIPER_JOINT_UPPER = np.array([2.618, 3.14, 0., 1.57, 1.57, 2.879793])
+
+def piper_ee_limits(xyz_limit: float = .04, rpy_limit: float = .08) -> np.ndarray:
+    # Defaults match ren_openpi0. Absolute grippers are not clipped here.
+    return np.tile([xyz_limit] * 3 + [rpy_limit] * 3 + [np.inf], 2)
+
+
+@lru_cache(maxsize=1)
+def piper_solver():
+    # Joint-only training does not need the compiled extension.
+    import kincpp
+
+    return kincpp.KinematicsSolver(PIPER_M, PIPER_S, PIPER_JOINT_LOWER, PIPER_JOINT_UPPER)
+
+
+def piper_fk(states: np.ndarray) -> np.ndarray:
+    """Return [N, 2, 4, 4] TCP poses using one batched FK call for both arms."""
+    joints = np.asarray(states).reshape(-1, 2, 7)[..., :6].reshape(-1, 6)
+    return np.asarray(piper_solver().batched_forward_kinematics(joints)).reshape(-1, 2, 4, 4)
+
+
+def base_frame_ee_delta(current: np.ndarray, following: np.ndarray) -> np.ndarray:
+    """Invert p_next = p + dp, R_next = Rx(dr) Ry(dp) Rz(dy) R (ren_openpi0 sim)."""
+    delta_rotation = following[..., :3, :3] @ np.swapaxes(current[..., :3, :3], -1, -2)
+    rpy = Rotation.from_matrix(delta_rotation.reshape(-1, 3, 3)).as_euler("XYZ")
+    rpy = rpy.reshape(*delta_rotation.shape[:-2], 3)
+    return np.concatenate((following[..., :3, 3] - current[..., :3, 3], rpy), axis=-1)
+
+
+def piper_delta_ee(current_states: np.ndarray, next_states: np.ndarray) -> np.ndarray:
+    """Return raw 14-D EE deltas; callers fill the two absolute gripper actions."""
+    poses = piper_fk(np.concatenate((current_states, next_states)))
+    count = len(current_states)
+    actions = np.zeros((count, 2, 7), dtype=np.float32)
+    actions[..., :6] = base_frame_ee_delta(poses[:count], poses[count:])
+    return actions.reshape(count, 14)

@@ -48,6 +48,7 @@ from launch_scripts.lerobot_utils.stats import (
 from olmo.data.data_loader import DataLoaderConfig
 from olmo.data.dynamic_packer import PackingConfig
 from olmo.data.robot_processing import RobotProcessorConfig
+from olmo.piper_kinematics import piper_ee_limits
 from olmo.extra_tokens import (
     ACTION_TOKENS,
     DEFAULT_NUM_DEPTH_TOKENS,
@@ -194,6 +195,9 @@ def _apply_delta_action_stats(
     tag_metadata_by_tag: dict,
     delta_joint_limit: float,
     action_stride: int = 1,
+    delta_action_mode: str = "joint",
+    delta_ee_xyz_limit: float = 0.04,
+    delta_ee_rpy_limit: float = 0.08,
 ) -> None:
     for tag, tag_stats in stats_by_tag.items():
         metadata = dict(tag_metadata_by_tag.get(tag, {}) or {})
@@ -209,29 +213,38 @@ def _apply_delta_action_stats(
         action_key = str(metadata.get("action_key") or "action")
         action_stats = dict(tag_stats[action_key])
         arm_indices = [i for i in range(action_dim) if i not in _PIPER_X_GRIPPER_INDICES]
+        limits = (piper_ee_limits(delta_ee_xyz_limit, delta_ee_rpy_limit)
+                  if delta_action_mode == "ee" else [delta_joint_limit] * action_dim)
         replacements = {
             "mean": 0.0,
-            "std": delta_joint_limit,
-            "min": -delta_joint_limit,
-            "max": delta_joint_limit,
-            "q01": -delta_joint_limit,
-            "q99": delta_joint_limit,
-            "q10": -delta_joint_limit,
-            "q90": delta_joint_limit,
+            "std": 1.0,
+            "min": -1.0,
+            "max": 1.0,
+            "q01": -1.0,
+            "q99": 1.0,
+            "q10": -1.0,
+            "q90": 1.0,
         }
         for key, replacement in replacements.items():
             values = action_stats.get(key)
             if isinstance(values, list) and len(values) == action_dim:
                 values = list(values)
                 for index in arm_indices:
-                    values[index] = replacement
+                    values[index] = float(replacement * limits[index])
                 action_stats[key] = values
         tag_stats[action_key] = action_stats
         metadata["use_delta_action"] = True
         metadata["delta_joint_limit"] = delta_joint_limit
         metadata["action_stride"] = action_stride
+        metadata["delta_action_mode"] = delta_action_mode
         metadata["gripper_indices"] = list(_PIPER_X_GRIPPER_INDICES)
-        metadata["control_mode"] = "delta joint pose"
+        metadata["control_mode"] = "delta end effector pose" if delta_action_mode == "ee" else "delta joint pose"
+        if delta_action_mode == "ee":
+            metadata["delta_ee_xyz_limit"] = delta_ee_xyz_limit
+            metadata["delta_ee_rpy_limit"] = delta_ee_rpy_limit
+            metadata["delta_ee_limits"] = limits[:6].tolist()
+            metadata["delta_ee_frame"] = "base"
+            metadata["delta_ee_euler_convention"] = "XYZ"
         tag_metadata_by_tag[tag] = metadata
 
 
@@ -440,13 +453,25 @@ def main():
         type=_parse_bool_arg,
         default=False,
         metavar="BOOL",
-        help="Train arm actions as clipped h_(i+1)-h_i joint-position deltas.",
+        help="Train arm actions as clipped joint or base-frame EE deltas.",
+    )
+    parser.add_argument(
+        "--delta_action_mode", default="joint", choices=("joint", "ee"),
+        help="Delta action representation used with --use_delta_action (default: joint).",
     )
     parser.add_argument(
         "--delta_joint_limit",
         default=0.1,
         type=float,
-        help="Per-step arm joint-position delta limit in radians.",
+        help="Per-step arm joint-position delta limit in radians; ignored in EE mode.",
+    )
+    parser.add_argument(
+        "--delta_ee_xyz_limit", default=0.04, type=float,
+        help="Per-axis EE translation delta limit in metres (EE mode only).",
+    )
+    parser.add_argument(
+        "--delta_ee_rpy_limit", default=0.08, type=float,
+        help="Per-component EE rotation delta limit in radians (EE mode only).",
     )
     parser.add_argument(
         "--action_stride",
@@ -454,7 +479,7 @@ def main():
         type=int,
         help=(
             "With --use_delta_action, advance each action by this many steps after static "
-            "filtering and clip joint deltas to --delta_joint_limit. Defaults to 1 (no skipping)."
+            "filtering. Defaults to 1 (no skipping)."
         ),
     )
     parser.add_argument("--num_flow_timesteps", default=1, type=int)
@@ -706,7 +731,9 @@ def main():
         raise ValueError("--action_stride requires --use_delta_action=true.")
     if args.use_delta_action and args.norm_mode == "none":
         raise ValueError("--use_delta_action requires action normalization.")
-    if args.delta_joint_limit <= 0:
+    if args.delta_action_mode == "ee" and not args.use_delta_action:
+        raise ValueError("--delta_action_mode=ee requires --use_delta_action=true.")
+    if args.delta_action_mode == "joint" and args.delta_joint_limit <= 0:
         raise ValueError("--delta_joint_limit must be > 0.")
     prepare_torchrun_environment()
 
@@ -1013,6 +1040,9 @@ def main():
             lerobot_tag_metadata_by_tag,
             float(args.delta_joint_limit),
             action_stride=args.action_stride,
+            delta_action_mode=args.delta_action_mode,
+            delta_ee_xyz_limit=args.delta_ee_xyz_limit,
+            delta_ee_rpy_limit=args.delta_ee_rpy_limit,
         )
     if stats_by_tag:
         _store_env_json_in_file("LEROBOT_STATS_BY_TAG", stats_by_tag)
