@@ -68,6 +68,22 @@ def base_frame_ee_delta(current: np.ndarray, following: np.ndarray) -> np.ndarra
     return np.concatenate((following[..., :3, 3] - current[..., :3, 3], rpy), axis=-1)
 
 
+def adaptive_stride_offsets(poses, action_stride, xyz_limit, rpy_limit):
+    """Choose the longest bounded EE transition, falling back to stride 1."""
+    limits = np.array([xyz_limit] * 3 + [rpy_limit] * 3)
+    offsets = [0]
+    while offsets[-1] < len(poses) - 1:
+        start = offsets[-1]
+        stride = min(action_stride, len(poses) - 1 - start)
+        while stride > 1:
+            delta = base_frame_ee_delta(poses[start], poses[start + stride]).astype(np.float32)
+            if np.all(np.abs(delta) <= limits):
+                break
+            stride -= 1
+        offsets.append(start + stride)
+    return np.asarray(offsets)
+
+
 def piper_delta_ee(current_states: np.ndarray, next_states: np.ndarray) -> np.ndarray:
     """Return raw 14-D EE deltas; callers fill the two absolute gripper actions."""
     poses = piper_fk(np.concatenate((current_states, next_states)))

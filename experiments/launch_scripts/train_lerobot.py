@@ -198,6 +198,7 @@ def _apply_delta_action_stats(
     delta_action_mode: str = "joint",
     delta_ee_xyz_limit: float = 0.04,
     delta_ee_rpy_limit: float = 0.08,
+    adaptive_stride: bool = True,
 ) -> None:
     for tag, tag_stats in stats_by_tag.items():
         metadata = dict(tag_metadata_by_tag.get(tag, {}) or {})
@@ -236,6 +237,7 @@ def _apply_delta_action_stats(
         metadata["use_delta_action"] = True
         metadata["delta_joint_limit"] = delta_joint_limit
         metadata["action_stride"] = action_stride
+        metadata["adaptive_stride"] = adaptive_stride and delta_action_mode == "ee"
         metadata["delta_action_mode"] = delta_action_mode
         metadata["gripper_indices"] = list(_PIPER_X_GRIPPER_INDICES)
         metadata["control_mode"] = "delta end effector pose" if delta_action_mode == "ee" else "delta joint pose"
@@ -524,8 +526,14 @@ def main():
         type=int,
         help=(
             "With --use_delta_action, advance each action by this many steps after static "
-            "filtering. Defaults to 1 (no skipping)."
+            "filtering, or use it as the maximum stride with adaptive_stride. Defaults to 1 (no skipping)."
         ),
+    )
+    parser.add_argument(
+        "--adaptive_stride", type=_parse_bool_arg, default=True, metavar="BOOL",
+        help="In delta EE mode, shorten strides after static filtering to fit both arms' EE limits. "
+             "Stride-1 violations are still clipped; no synthetic transitions are inserted. "
+             "Ignored in joint and absolute-action modes.",
     )
     parser.add_argument("--num_flow_timesteps", default=1, type=int)
     parser.add_argument("--flow_matching_beta_alpha", default=1.0, type=float)
@@ -1088,6 +1096,7 @@ def main():
             delta_action_mode=args.delta_action_mode,
             delta_ee_xyz_limit=args.delta_ee_xyz_limit,
             delta_ee_rpy_limit=args.delta_ee_rpy_limit,
+            adaptive_stride=args.adaptive_stride,
         )
     if stats_by_tag and args.append_ee_pose_to_observation:
         _append_ee_pose_normalization_stats(stats_by_tag, lerobot_tag_metadata_by_tag)

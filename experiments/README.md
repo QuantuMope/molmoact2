@@ -46,6 +46,19 @@ Each strided action uses the absolute gripper command from the last retained
 transition in that stride: stride 4 pairs `q[4] - q[0]` with `gripper_action[3]`.
 This applies to both joint and EE modes; stride 1 is unchanged.
 
+In EE mode, `--adaptive_stride=true` (default) treats `action_stride` as a maximum.
+After static filtering, each episode is traversed using the longest stride whose
+XYZ and intrinsic-XYZ rotation deltas fit the limits for both arms. Training chunks
+are sliding windows of `action_chunk_size` consecutive actions in this adapted
+sequence, anchored at real recorded observations. The final shorter stride is kept,
+but anchors without a complete chunk are dropped. Grippers still use the last
+retained command in each chosen segment. This may slow large-motion sections at a
+fixed execution frequency. Stride-1 violations are clipped, not subdivided; startup
+logs report their count and the selected stride histogram. Clipping and delta
+statistics below reflect the adapted training chunks. Use `--adaptive_stride=false`
+to restore fixed-stride EE training. Joint and absolute-action modes are unchanged;
+checkpoint normalization metadata records whether adaptive stride was enabled.
+
 EE mode uses kincpp batched FK for the Piper TCP defined in `olmo/piper_kinematics.py`.
 Each arm contributes `[dx, dy, dz, droll, dpitch, dyaw, absolute_gripper]`;
 observations remain joint positions. Translation deltas are in each arm's base

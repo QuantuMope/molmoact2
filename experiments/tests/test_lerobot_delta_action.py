@@ -225,7 +225,7 @@ def test_filtered_delta_action_chunks_use_filtered_transition_order():
 def _make_skipped_wrapper(values, *, action_stride=1, horizon=2, threshold=0.01,
                           use_hf=True, episodes=None, drop_n_last_frames=0,
                           delta_joint_limit=0.1, gripper_values=None, delta_action_mode="joint",
-                          delta_ee_xyz_limit=.04, delta_ee_rpy_limit=.08):
+                          delta_ee_xyz_limit=.04, delta_ee_rpy_limit=.08, adaptive_stride=False):
     states = np.zeros((len(values), 14), dtype=np.float32)
     states[:, 0] = values
     states[:, 1] = -0.2 * states[:, 0]
@@ -280,6 +280,7 @@ def _make_skipped_wrapper(values, *, action_stride=1, horizon=2, threshold=0.01,
         use_delta_action=True,
         delta_action_mode=delta_action_mode,
         action_stride=action_stride,
+        adaptive_stride=adaptive_stride,
         delta_joint_limit=delta_joint_limit,
         delta_ee_xyz_limit=delta_ee_xyz_limit,
         delta_ee_rpy_limit=delta_ee_rpy_limit,

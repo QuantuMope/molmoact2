@@ -1477,6 +1477,7 @@ class LeRobotDatasetWrapper(Dataset):
         append_ee_pose_to_observation: bool = False,
         delta_joint_limit: float = 0.1,
         action_stride: int = 1,
+        adaptive_stride: bool = False,
         delta_action_mode: str = "joint",
         delta_ee_xyz_limit: float = .04,
         delta_ee_rpy_limit: float = .08,
@@ -1562,6 +1563,9 @@ class LeRobotDatasetWrapper(Dataset):
         self.append_ee_pose_to_observation = append_ee_pose_to_observation
         self.delta_joint_limit = float(delta_joint_limit)
         self.action_stride = action_stride
+        self.adaptive_stride = (
+            adaptive_stride and use_delta_action and delta_action_mode == "ee" and action_stride > 0
+        )
         self.delta_action_mode = delta_action_mode
         self.delta_ee_xyz_limit = delta_ee_xyz_limit
         self.delta_ee_rpy_limit = delta_ee_rpy_limit
@@ -2612,11 +2616,11 @@ class LeRobotDatasetWrapper(Dataset):
 
     def _build_filtered_delta_action(self, sample_index: int) -> np.ndarray:
         offset = int(self._filtered_action_offsets[sample_index])
-        stride = max(self.action_stride, 1)
+        stride = self._filtered_action_stride
         end = offset + self.tag_action_horizon * stride
         action_indices = self._filtered_action_indices[offset:end:stride]
         next_indices = self._filtered_next_indices[offset + stride - 1:end:stride]
-        gripper_indices = self._filtered_action_indices[offset + stride - 1:end:stride]
+        gripper_indices = self._filtered_gripper_indices[offset + stride - 1:end:stride]
         hf_dataset = getattr(self.dataset, "hf_dataset", None)
 
         if hf_dataset is not None:
@@ -2666,6 +2670,10 @@ class LeRobotDatasetWrapper(Dataset):
         return action
 
     def _build_episode_index(self) -> None:
+        adaptive_stride = getattr(self, "adaptive_stride", False)
+        self._filtered_action_stride = 1 if adaptive_stride else max(self.action_stride, 1)
+        self.adaptive_stride_counts = {}
+        self.adaptive_stride_limit_violations = 0
         self.static_filter_total_frames = 0
         self.static_filter_static_frames = 0
         self.delta_action_clipped_chunks = 0
@@ -2686,6 +2694,7 @@ class LeRobotDatasetWrapper(Dataset):
         }
         self._filtered_action_indices = None
         self._filtered_next_indices = None
+        self._filtered_gripper_indices = None
         self._filtered_action_offsets = None
         self._filtered_state_action_dataset = None
         filter_transitions = self.static_threshold > 0 or (
@@ -2713,6 +2722,7 @@ class LeRobotDatasetWrapper(Dataset):
         kept_indices: Optional[List[int]] = [] if filter_transitions else None
         filtered_action_indices: List[int] = []
         filtered_next_indices: List[int] = []
+        filtered_gripper_indices: List[int] = []
         filtered_action_offsets: List[int] = []
         static_filter_total = 0
         retained_transition_count = 0
@@ -2816,18 +2826,42 @@ class LeRobotDatasetWrapper(Dataset):
                 if self.use_delta_action and episode_kept_indices:
                     retained_transition_count += len(episode_kept_indices)
                     episode_offset = len(filtered_action_indices)
-                    filtered_action_indices.extend(episode_kept_indices)
+                    current_states = states[:-1][moving]
+                    next_states = states[1:][moving]
+                    episode_gripper_indices = episode_kept_indices.copy()
                     if self.action_stride > 0:
                         # Compress to retained states, keeping the final transition's endpoint.
                         episode_next_indices = episode_kept_indices[1:] + episode_next_indices[-1:]
+                        next_states = np.concatenate((current_states[1:], next_states[-1:]))
+                    if adaptive_stride:
+                        from olmo.piper_kinematics import adaptive_stride_offsets, piper_fk
+
+                        poses = piper_fk(np.concatenate((current_states, next_states[-1:])))
+                        boundaries = adaptive_stride_offsets(
+                            poses, self.action_stride, self.delta_ee_xyz_limit, self.delta_ee_rpy_limit,
+                        )
+                        starts, ends = boundaries[:-1], boundaries[1:]
+                        episode_gripper_indices = [episode_kept_indices[end - 1] for end in ends]
+                        episode_kept_indices = [episode_kept_indices[start] for start in starts]
+                        episode_next_indices = [episode_next_indices[end - 1] for end in ends]
+                        current_states = current_states[starts]
+                        next_states = next_states[ends - 1]
+                        strides, counts = np.unique(ends - starts, return_counts=True)
+                        for value, count in zip(strides, counts):
+                            value = int(value)
+                            self.adaptive_stride_counts[value] = (
+                                self.adaptive_stride_counts.get(value, 0) + int(count)
+                            )
+                        raw = _compute_action_delta(current_states, next_states, "ee")
+                        self.adaptive_stride_limit_violations += int(np.count_nonzero(
+                            np.any(np.abs(raw) > self.delta_action_limits, axis=-1)
+                        ))
+                    filtered_action_indices.extend(episode_kept_indices)
                     filtered_next_indices.extend(episode_next_indices)
-                    stride = max(self.action_stride, 1)
+                    filtered_gripper_indices.extend(episode_gripper_indices)
+                    stride = self._filtered_action_stride
                     num_anchors = len(episode_kept_indices) - self.tag_action_horizon * stride + 1
                     if num_anchors > 0:
-                        current_states = states[:-1][moving]
-                        next_states = states[1:][moving]
-                        if self.action_stride > 0:
-                            next_states = np.concatenate((current_states[1:], next_states[-1:]))
                         deltas = _compute_action_delta(
                             current_states[:len(current_states) - stride + 1],
                             next_states[stride - 1:],
@@ -2879,6 +2913,13 @@ class LeRobotDatasetWrapper(Dataset):
             ranges.append((start, trimmed_end))
             cumulative.append(total)
         if kept_indices is not None:
+            if adaptive_stride:
+                log.info(
+                    "LeRobot adaptive strides for repo '%s': %s; stride-1 EE limit violations: %d/%d "
+                    "selected transitions (before full-horizon filtering).",
+                    self._get_repo_id(), self.adaptive_stride_counts,
+                    self.adaptive_stride_limit_violations, sum(self.adaptive_stride_counts.values()),
+                )
             static_filter_static = max(
                 static_filter_total
                 - (retained_transition_count if self.use_delta_action else len(kept_indices)),
@@ -2891,6 +2932,7 @@ class LeRobotDatasetWrapper(Dataset):
                 if self.use_delta_action:
                     self._filtered_action_indices = np.asarray(filtered_action_indices, dtype=np.int64)
                     self._filtered_next_indices = np.asarray(filtered_next_indices, dtype=np.int64)
+                    self._filtered_gripper_indices = np.asarray(filtered_gripper_indices, dtype=np.int64)
                     self._filtered_action_offsets = np.asarray(filtered_action_offsets, dtype=np.int64)
                 self._effective_len = len(kept_indices)
                 if self.use_delta_action:
@@ -3733,6 +3775,7 @@ def build_lerobot_dataset(
         use_delta_action=use_delta_action,
         delta_joint_limit=delta_joint_limit,
         action_stride=action_stride,
+        adaptive_stride=bool(tag_metadata.get("adaptive_stride", False)),
         delta_action_mode=delta_action_mode,
         delta_ee_xyz_limit=delta_ee_xyz_limit,
         delta_ee_rpy_limit=delta_ee_rpy_limit,
