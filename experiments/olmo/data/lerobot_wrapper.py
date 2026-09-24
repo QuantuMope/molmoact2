@@ -1474,6 +1474,7 @@ class LeRobotDatasetWrapper(Dataset):
         tag_action_horizon: int = 1,
         tag_n_action_steps: int = 1,
         use_delta_action: bool = False,
+        append_ee_pose_to_observation: bool = False,
         delta_joint_limit: float = 0.1,
         action_stride: int = 1,
         delta_action_mode: str = "joint",
@@ -1558,6 +1559,7 @@ class LeRobotDatasetWrapper(Dataset):
         self.state_keys = _require_non_empty_string_sequence(state_keys, label="state_keys")
         self.action_keys = _require_non_empty_string_sequence(action_keys, label="action_keys")
         self.use_delta_action = bool(use_delta_action)
+        self.append_ee_pose_to_observation = append_ee_pose_to_observation
         self.delta_joint_limit = float(delta_joint_limit)
         self.action_stride = action_stride
         self.delta_action_mode = delta_action_mode
@@ -3129,6 +3131,9 @@ class LeRobotDatasetWrapper(Dataset):
                     self.delta_ee_xyz_limit,
                     self.delta_ee_rpy_limit,
                 )
+        if self.append_ee_pose_to_observation:
+            from olmo.piper_kinematics import append_piper_ee_pose
+            state = append_piper_ee_pose(state)
         if normalize_state_action and self.robot_processor is not None:
             state = self.robot_processor.normalize_state(state, repo_id)
             action = self.robot_processor.normalize_action(action, repo_id)
@@ -3731,6 +3736,7 @@ def build_lerobot_dataset(
         delta_action_mode=delta_action_mode,
         delta_ee_xyz_limit=delta_ee_xyz_limit,
         delta_ee_rpy_limit=delta_ee_rpy_limit,
+        append_ee_pose_to_observation=bool(tag_metadata.get("append_ee_pose_to_observation", False)),
         gripper_indices=gripper_indices,
         max_action_horizon=max_action_horizon,
         max_action_dim=max_action_dim,

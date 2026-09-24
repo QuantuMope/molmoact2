@@ -460,6 +460,28 @@ HF_ACCESS_TOKEN="${HF_ACCESS_TOKEN:-}" WANDB_API_KEY="${WANDB_API_KEY:-}" torchr
   --style_robot_depth_action=1.0
 ```
 
+### Piper-X end-effector observations
+
+Pass `--append_ee_pose_to_observation=true` to `train_lerobot.py` to append
+each arm's current TCP pose to the existing 14 joint/gripper values (default: false).
+The resulting 32-D state is `[joints/grippers, left_xyz, left_R_col0, left_R_col1,
+right_xyz, right_R_col0, right_R_col1]`. Batched kincpp FK uses the same TCP as
+delta-EE actions, relative to each arm's own base. No Euler angles are used for
+these observations, and the action representation is unchanged.
+
+XYZ normalization uses fixed bounds `[-0.85, -0.85, -0.45]` to
+`[0.85, 0.85, 0.95]` metres, based on joint-limit-aware reach estimates with margin.
+Rotation components use `[-1, 1]`. These are observation normalization bounds,
+not controller constraints or bounds fitted to demonstrations. Existing joint
+normalization is unchanged. The feature works with either joint or EE actions;
+static filtering and action stride still operate on the original joint data.
+
+The flag, pose convention, and normalization parameters are saved in checkpoint
+robot metadata. Genesis RL inference reads this flag automatically and appends the
+same pose; its separate numeric joint input to the RL heads remains unchanged.
+Other Hugging Face callers must supply the matching raw 32-D state to
+`predict_action`. Changing this flag requires a correspondingly trained checkpoint.
+
 ### Fine-Tuning Existing Mixtures
 
 Use the closest released checkpoint for the target embodiment:

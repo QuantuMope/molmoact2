@@ -48,7 +48,7 @@ from launch_scripts.lerobot_utils.stats import (
 from olmo.data.data_loader import DataLoaderConfig
 from olmo.data.dynamic_packer import PackingConfig
 from olmo.data.robot_processing import RobotProcessorConfig
-from olmo.piper_kinematics import piper_ee_limits
+from olmo.piper_kinematics import PIPER_EE_XYZ_MIN, PIPER_EE_XYZ_MAX, piper_ee_limits
 from olmo.extra_tokens import (
     ACTION_TOKENS,
     DEFAULT_NUM_DEPTH_TOKENS,
@@ -245,6 +245,46 @@ def _apply_delta_action_stats(
             metadata["delta_ee_limits"] = limits[:6].tolist()
             metadata["delta_ee_frame"] = "base"
             metadata["delta_ee_euler_convention"] = "XYZ"
+        tag_metadata_by_tag[tag] = metadata
+
+
+def _append_ee_pose_normalization_stats(stats_by_tag: dict, tag_metadata_by_tag: dict) -> None:
+    # Fixed physical bounds, not dataset statistics. Mean/std and quantile modes
+    # use equivalent affine parameters for the appended pose dimensions.
+    lower = (PIPER_EE_XYZ_MIN + [-1.] * 6) * 2
+    upper = (PIPER_EE_XYZ_MAX + [1.] * 6) * 2
+    extensions = {
+        "min": lower, "max": upper,
+        "q01": lower, "q99": upper, "q10": lower, "q90": upper,
+        "mean": [(lo + hi) / 2 for lo, hi in zip(lower, upper)],
+        "std": [(hi - lo) / 2 for lo, hi in zip(lower, upper)],
+        "mask": [True] * 18,
+        "names": [f"{arm}_ee_{dim}" for arm in ("left", "right")
+                  for dim in ("x", "y", "z", "r00", "r10", "r20", "r01", "r11", "r21")],
+    }
+    for tag, tag_stats in stats_by_tag.items():
+        metadata = dict(tag_metadata_by_tag.get(tag, {}) or {})
+        setup = str(metadata.get("setup_type", "")).lower()
+        if not (tag == "piper_x" or ("piper" in setup and "x" in setup)):
+            raise ValueError("--append_ee_pose_to_observation currently supports only Piper-X.")
+        state_key = _state_stats_key_from_metadata(metadata)
+        state_stats = dict(tag_stats[state_key])
+        for key, extra in extensions.items():
+            if key in state_stats:
+                if len(state_stats[key]) != 14:
+                    raise ValueError("Piper EE observations require 14-D joint-state statistics.")
+                state_stats[key] = list(state_stats[key]) + extra
+        tag_stats[state_key] = state_stats
+        metadata.update(
+            append_ee_pose_to_observation=True,
+            state_dim=32,
+            ee_pose_frame="base",
+            ee_pose_rotation_representation="rotation6d_columns",
+            ee_pose_xyz_min=list(PIPER_EE_XYZ_MIN),
+            ee_pose_xyz_max=list(PIPER_EE_XYZ_MAX),
+        )
+        if "state_mask" in metadata:
+            metadata["state_mask"] = list(metadata["state_mask"]) + [True] * 18
         tag_metadata_by_tag[tag] = metadata
 
 
@@ -448,6 +488,11 @@ def main():
         help="Override the action horizon for every dataset tag and the model.",
     )
     parser.add_argument("--n_obs_steps", default=1, type=int)
+    parser.add_argument(
+        "--append_ee_pose_to_observation", type=_parse_bool_arg, default=False, metavar="BOOL",
+        help="Append each Piper-X arm's base-frame XYZ and rotation6D to joint observations, "
+             "using batched FK and fixed physical workspace normalization bounds.",
+    )
     parser.add_argument(
         "--use_delta_action",
         type=_parse_bool_arg,
@@ -1044,6 +1089,8 @@ def main():
             delta_ee_xyz_limit=args.delta_ee_xyz_limit,
             delta_ee_rpy_limit=args.delta_ee_rpy_limit,
         )
+    if stats_by_tag and args.append_ee_pose_to_observation:
+        _append_ee_pose_normalization_stats(stats_by_tag, lerobot_tag_metadata_by_tag)
     if stats_by_tag:
         _store_env_json_in_file("LEROBOT_STATS_BY_TAG", stats_by_tag)
         _store_env_json_in_file("LEROBOT_REPO_TO_TAG", repo_to_tag)

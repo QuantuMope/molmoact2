@@ -25,6 +25,22 @@ PIPER_S = np.array([
 PIPER_JOINT_LOWER = np.array([-2.618, 0., -2.9671, -1.57, -1.57, -2.879793])
 PIPER_JOINT_UPPER = np.array([2.618, 3.14, 0., 1.57, 1.57, 2.879793])
 
+# Joint-limit-aware TCP workspace bounds with margin, in each arm's base frame.
+PIPER_EE_XYZ_MIN = [-.85, -.85, -.45]
+PIPER_EE_XYZ_MAX = [.85, .85, .95]
+
+
+def append_piper_ee_pose(states: np.ndarray) -> np.ndarray:
+    """Append left/right [xyz, R[:, 0], R[:, 1]] to raw (..., 14) joint states."""
+    states = np.asarray(states, dtype=np.float32)
+    if states.shape[-1] != 14:
+        raise ValueError("Piper EE observations require 14 joint/gripper values.")
+    poses = piper_fk(states)
+    ee = np.concatenate((poses[..., :3, 3], poses[..., :3, 0], poses[..., :3, 1]), axis=-1)
+    ee = ee.reshape(*states.shape[:-1], 18).astype(np.float32)
+    return np.concatenate((states, ee), axis=-1)
+
+
 def piper_ee_limits(xyz_limit: float = .04, rpy_limit: float = .08) -> np.ndarray:
     # Defaults match ren_openpi0. Absolute grippers are not clipped here.
     return np.tile([xyz_limit] * 3 + [rpy_limit] * 3 + [np.inf], 2)
