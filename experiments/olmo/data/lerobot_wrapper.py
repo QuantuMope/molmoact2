@@ -561,7 +561,18 @@ def _select_split_episodes(
     *,
     repo_id: str,
     dataset_root: Optional[Path],
+    active_arm: str = "both",
 ) -> Optional[List[int]]:
+    indices_file = os.environ.get("LEROBOT_EPISODE_INDICES_FILE")
+    if indices_file:
+        selected = json.loads(Path(indices_file).read_text())
+        episodes = sorted(set(selected) if episodes is None else set(selected).intersection(episodes))
+    if active_arm == "left":
+        from olmo.piper_subset import left_arm_episode_ids
+
+        selected = left_arm_episode_ids(dataset_root)
+        episodes = sorted(set(selected) if episodes is None else set(selected).intersection(episodes))
+        log.info("Selected %d left-only Piper-X episodes before train/validation split.", len(episodes))
     eval_fraction = _get_env_float("LEROBOT_EVAL_SPLIT", 0.0)
     if eval_fraction <= 0.0:
         return episodes
@@ -1475,6 +1486,7 @@ class LeRobotDatasetWrapper(Dataset):
         tag_n_action_steps: int = 1,
         use_delta_action: bool = False,
         append_ee_pose_to_observation: bool = False,
+        active_arm: str = "both",
         delta_joint_limit: float = 0.1,
         action_stride: int = 1,
         adaptive_stride: bool = False,
@@ -1561,6 +1573,7 @@ class LeRobotDatasetWrapper(Dataset):
         self.action_keys = _require_non_empty_string_sequence(action_keys, label="action_keys")
         self.use_delta_action = bool(use_delta_action)
         self.append_ee_pose_to_observation = append_ee_pose_to_observation
+        self.active_arm = active_arm
         self.delta_joint_limit = float(delta_joint_limit)
         self.action_stride = action_stride
         self.adaptive_stride = (
@@ -3176,6 +3189,11 @@ class LeRobotDatasetWrapper(Dataset):
         if self.append_ee_pose_to_observation:
             from olmo.piper_kinematics import append_piper_ee_pose
             state = append_piper_ee_pose(state)
+        if self.active_arm == "left":
+            state_indices = list(range(7)) + (list(range(14, 23))
+                                              if self.append_ee_pose_to_observation else [])
+            state = state[..., state_indices]
+            action = action[..., :7]
         if normalize_state_action and self.robot_processor is not None:
             state = self.robot_processor.normalize_state(state, repo_id)
             action = self.robot_processor.normalize_action(action, repo_id)
@@ -3480,11 +3498,15 @@ def build_lerobot_dataset(
         # LeRobotDataset will download into this location.
         dataset_root = base_path / dataset_repo_id
 
+    repo_to_tag_env = _get_env_json("LEROBOT_REPO_TO_TAG") or {}
+    tag_metadata_env = _get_env_json("LEROBOT_TAG_METADATA")
+    input_metadata = (tag_metadata_env or {}).get(repo_to_tag_env.get(metadata_repo_id), {})
     selected_episodes = _select_split_episodes(
         parsed.episodes,
         split,
         repo_id=dataset_repo_id,
         dataset_root=dataset_root,
+        active_arm=input_metadata.get("active_arm", "both"),
     )
 
     depth_dataset: Optional[LeRobotDataset] = None
@@ -3531,8 +3553,6 @@ def build_lerobot_dataset(
                 revision="main",
             )
 
-    repo_to_tag_env = _get_env_json("LEROBOT_REPO_TO_TAG") or {}
-    tag_metadata_env = _get_env_json("LEROBOT_TAG_METADATA")
     random_camera_order = _normalize_random_camera_order(
         random_camera_order
         if random_camera_order is not None
@@ -3780,7 +3800,9 @@ def build_lerobot_dataset(
         delta_ee_xyz_limit=delta_ee_xyz_limit,
         delta_ee_rpy_limit=delta_ee_rpy_limit,
         append_ee_pose_to_observation=bool(tag_metadata.get("append_ee_pose_to_observation", False)),
-        gripper_indices=gripper_indices,
+        active_arm=tag_metadata.get("active_arm", "both"),
+        # Raw demonstrations remain 14-D through delta construction; slice only afterwards.
+        gripper_indices=(6, 13) if tag_metadata.get("active_arm") == "left" else gripper_indices,
         max_action_horizon=max_action_horizon,
         max_action_dim=max_action_dim,
         robot_processor=robot_processor,

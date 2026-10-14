@@ -124,6 +124,26 @@ _PIPER_X_JOINT_LIMIT_NORMALIZATION_MAX = [
 _PIPER_X_GRIPPER_INDICES = (6, 13)
 
 
+def _configure_piper_inputs(metadata_by_tag, active_arm="both", camera_keys=None):
+    for metadata in metadata_by_tag.values():
+        if camera_keys is not None:
+            metadata["camera_keys"] = camera_keys.split(",")
+        if active_arm == "left":
+            metadata.update(active_arm="left", action_dim=7, state_dim=7,
+                            setup_type="single left piper-x robotic arm")
+
+
+def _select_piper_stats(stats_by_tag, metadata_by_tag):
+    for tag, metadata in metadata_by_tag.items():
+        if metadata.get("active_arm") != "left":
+            continue
+        for key in (metadata["action_key"], _state_stats_key_from_metadata(metadata)):
+            stats_by_tag[tag][key] = {
+                name: values[:7] if isinstance(values, list) and len(values) == 14 else values
+                for name, values in stats_by_tag[tag][key].items()
+            }
+
+
 def _state_stats_key_from_metadata(metadata: dict) -> str:
     state_keys = metadata.get("state_keys")
     if isinstance(state_keys, list) and state_keys:
@@ -138,9 +158,9 @@ def _joint_limit_stats_for_tag(tag: str, metadata: dict, existing_stats: object)
     action_dim = int(metadata.get("action_dim") or 0)
     setup_type = str(metadata.get("setup_type") or "").lower()
     is_piper_x = tag == "piper_x" or ("piper" in setup_type and "x" in setup_type)
-    if not is_piper_x or action_dim != 14:
+    if not is_piper_x or action_dim not in (7, 14):
         raise ValueError(
-            "--use_joint_lim_normalization currently supports only the piper_x 14-D "
+            "--use_joint_lim_normalization currently supports only the piper_x 7-D/14-D "
             f"absolute joint-pose layout; got tag={tag!r}, action_dim={action_dim}, "
             f"setup_type={metadata.get('setup_type')!r}."
         )
@@ -156,8 +176,8 @@ def _joint_limit_stats_for_tag(tag: str, metadata: dict, existing_stats: object)
         count = existing_stats.get("count")
         if count is not None:
             stats["count"] = count
-    stats["min"] = list(_PIPER_X_JOINT_LIMIT_NORMALIZATION_MIN)
-    stats["max"] = list(_PIPER_X_JOINT_LIMIT_NORMALIZATION_MAX)
+    stats["min"] = list(_PIPER_X_JOINT_LIMIT_NORMALIZATION_MIN[:action_dim])
+    stats["max"] = list(_PIPER_X_JOINT_LIMIT_NORMALIZATION_MAX[:action_dim])
     return stats
 
 
@@ -205,9 +225,9 @@ def _apply_delta_action_stats(
         action_dim = int(metadata.get("action_dim") or 0)
         setup_type = str(metadata.get("setup_type") or "").lower()
         is_piper_x = tag == "piper_x" or ("piper" in setup_type and "x" in setup_type)
-        if not is_piper_x or action_dim != 14:
+        if not is_piper_x or action_dim not in (7, 14):
             raise ValueError(
-                "--use_delta_action currently supports only the piper_x 14-D layout; "
+                "--use_delta_action currently supports only the piper_x 7-D/14-D layout; "
                 f"got tag={tag!r}, action_dim={action_dim}."
             )
 
@@ -239,7 +259,7 @@ def _apply_delta_action_stats(
         metadata["action_stride"] = action_stride
         metadata["adaptive_stride"] = adaptive_stride and delta_action_mode == "ee"
         metadata["delta_action_mode"] = delta_action_mode
-        metadata["gripper_indices"] = list(_PIPER_X_GRIPPER_INDICES)
+        metadata["gripper_indices"] = list(range(6, action_dim, 7))
         metadata["control_mode"] = "delta end effector pose" if delta_action_mode == "ee" else "delta joint pose"
         if delta_action_mode == "ee":
             metadata["delta_ee_xyz_limit"] = delta_ee_xyz_limit
@@ -271,22 +291,24 @@ def _append_ee_pose_normalization_stats(stats_by_tag: dict, tag_metadata_by_tag:
             raise ValueError("--append_ee_pose_to_observation currently supports only Piper-X.")
         state_key = _state_stats_key_from_metadata(metadata)
         state_stats = dict(tag_stats[state_key])
+        joint_dim = 7 if metadata.get("active_arm") == "left" else 14
+        pose_dim = joint_dim // 7 * 9
         for key, extra in extensions.items():
             if key in state_stats:
-                if len(state_stats[key]) != 14:
-                    raise ValueError("Piper EE observations require 14-D joint-state statistics.")
-                state_stats[key] = list(state_stats[key]) + extra
+                if len(state_stats[key]) != joint_dim:
+                    raise ValueError(f"Piper EE observations require {joint_dim}-D joint-state statistics.")
+                state_stats[key] = list(state_stats[key]) + extra[:pose_dim]
         tag_stats[state_key] = state_stats
         metadata.update(
             append_ee_pose_to_observation=True,
-            state_dim=32,
+            state_dim=joint_dim + pose_dim,
             ee_pose_frame="base",
             ee_pose_rotation_representation="rotation6d_columns",
             ee_pose_xyz_min=list(PIPER_EE_XYZ_MIN),
             ee_pose_xyz_max=list(PIPER_EE_XYZ_MAX),
         )
         if "state_mask" in metadata:
-            metadata["state_mask"] = list(metadata["state_mask"]) + [True] * 18
+            metadata["state_mask"] = list(metadata["state_mask"]) + [True] * pose_dim
         tag_metadata_by_tag[tag] = metadata
 
 
@@ -371,6 +393,12 @@ def main():
     parser = argparse.ArgumentParser(prog="Train a multitask model")
     parser.add_argument("checkpoint", help="Path to checkpoint to start from")
     parser.add_argument("mixture", nargs="?", default="pre_post_train")
+    parser.add_argument("--camera_keys", default=None,
+                        help="Comma-separated dataset camera keys, in model input order.")
+    parser.add_argument("--active_arm", choices=["both", "left"], default="both",
+                        help="Piper-X left selects left-only episodes and trains 7-D actions/proprio.")
+    parser.add_argument("--episode_indices_file", default=None,
+                        help="Optional JSON episode-ID list, intersected with the arm filter before splitting.")
     parser.add_argument("--debug", type=_parse_bool_arg, default=False, metavar="BOOL")
     parser.add_argument("--debugger", type=_parse_bool_arg, default=False, metavar="BOOL")
     parser.add_argument("--model", default="video")
@@ -810,6 +838,9 @@ def main():
         TAG_METADATA_BY_TAG,
         action_chunk_size=args.action_chunk_size,
     )
+    if args.active_arm == "left" and args.mixture != "piper_x":
+        raise ValueError("--active_arm=left is supported for the piper_x mixture.")
+    _configure_piper_inputs(training_tag_metadata, args.active_arm, args.camera_keys)
     inferred_max_action_horizon = infer_max_action_horizon_from_lerobot_metadata(
         training_data_plan.robot_mixture,
         tag_metadata_by_tag=training_tag_metadata,
@@ -1078,6 +1109,7 @@ def main():
         tag_metadata_by_tag=training_tag_metadata,
     )
     if stats_by_tag:
+        _select_piper_stats(stats_by_tag, lerobot_tag_metadata_by_tag)
         _apply_tag_metadata_masks(
             stats_by_tag,
             lerobot_tag_metadata_by_tag,

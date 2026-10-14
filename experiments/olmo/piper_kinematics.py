@@ -31,13 +31,13 @@ PIPER_EE_XYZ_MAX = [.85, .85, .95]
 
 
 def append_piper_ee_pose(states: np.ndarray) -> np.ndarray:
-    """Append left/right [xyz, R[:, 0], R[:, 1]] to raw (..., 14) joint states."""
+    """Append each arm's [xyz, R[:, 0], R[:, 1]] to 7-D or 14-D joint states."""
     states = np.asarray(states, dtype=np.float32)
-    if states.shape[-1] != 14:
-        raise ValueError("Piper EE observations require 14 joint/gripper values.")
+    if states.shape[-1] not in (7, 14):
+        raise ValueError("Piper EE observations require 7 or 14 joint/gripper values.")
     poses = piper_fk(states)
     ee = np.concatenate((poses[..., :3, 3], poses[..., :3, 0], poses[..., :3, 1]), axis=-1)
-    ee = ee.reshape(*states.shape[:-1], 18).astype(np.float32)
+    ee = ee.reshape(*states.shape[:-1], states.shape[-1] // 7 * 9).astype(np.float32)
     return np.concatenate((states, ee), axis=-1)
 
 
@@ -55,9 +55,10 @@ def piper_solver():
 
 
 def piper_fk(states: np.ndarray) -> np.ndarray:
-    """Return [N, 2, 4, 4] TCP poses using one batched FK call for both arms."""
-    joints = np.asarray(states).reshape(-1, 2, 7)[..., :6].reshape(-1, 6)
-    return np.asarray(piper_solver().batched_forward_kinematics(joints)).reshape(-1, 2, 4, 4)
+    """Return [N, arms, 4, 4] TCP poses using one batched FK call."""
+    num_arms = states.shape[-1] // 7
+    joints = np.asarray(states).reshape(-1, num_arms, 7)[..., :6].reshape(-1, 6)
+    return np.asarray(piper_solver().batched_forward_kinematics(joints)).reshape(-1, num_arms, 4, 4)
 
 
 def base_frame_ee_delta(current: np.ndarray, following: np.ndarray) -> np.ndarray:

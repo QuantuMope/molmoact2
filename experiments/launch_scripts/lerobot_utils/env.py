@@ -81,6 +81,7 @@ def _run_torchcodec_preflight(model_cfg) -> None:
 
 
 def _set_lerobot_environment_from_args(args) -> None:
+    os.environ["LEROBOT_EPISODE_INDICES_FILE"] = getattr(args, "episode_indices_file", None) or ""
     os.environ["LEROBOT_N_OBS_STEPS"] = str(args.n_obs_steps)
     os.environ["LEROBOT_MAX_ACTION_HORIZON"] = str(args.max_action_horizon)
     os.environ.pop("LEROBOT_ACTION_HORIZON", None)
