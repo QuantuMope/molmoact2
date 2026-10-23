@@ -98,6 +98,15 @@ def _checkpoint_has_lora(checkpoint_dir: str | None) -> bool:
     return bool(lora_enabled)
 
 
+def _collect_lora_targets(module: torch.nn.Module) -> list[str]:
+    # Respect the ft_* freezes applied before injection. Use full paths so a
+    # trainable connector cannot also select same-named layers in a frozen ViT.
+    return [
+        name for name, submodule in module.named_modules()
+        if isinstance(submodule, torch.nn.Linear) and submodule.weight.requires_grad
+    ]
+
+
 def _distributed_nonzero_count(param: torch.Tensor) -> int:
     tensor = param.detach()
     local_tensor = tensor.to_local() if hasattr(tensor, "to_local") else tensor
@@ -374,17 +383,6 @@ def run_trainer(cfg: TrainConfig) -> None:
 
         compat_logged = False
 
-        def _collect_linear_leaf_names(module: torch.nn.Module) -> list[str]:
-            names: list[str] = []
-            seen: set[str] = set()
-            for name, sub in module.named_modules():
-                if isinstance(sub, torch.nn.Linear):
-                    leaf = name.rsplit(".", 1)[-1]
-                    if leaf not in seen:
-                        names.append(leaf)
-                        seen.add(leaf)
-            return names
-
         def _build_lora_config(target_modules: list[str]) -> LoraConfig:
             return LoraConfig(
                 r=model_cfg.lora_rank,
@@ -420,7 +418,7 @@ def run_trainer(cfg: TrainConfig) -> None:
             raise RuntimeError("Model has no transformer; cannot inject LoRA adapters.")
 
         if not hasattr(model.transformer, "peft_config"):
-            transformer_targets = _collect_linear_leaf_names(model.transformer)
+            transformer_targets = _collect_lora_targets(model.transformer)
             if transformer_targets:
                 log.info("LoRA transformer target modules: %s", transformer_targets)
                 model.transformer = _wrap_with_lora(
@@ -429,13 +427,13 @@ def run_trainer(cfg: TrainConfig) -> None:
                     label="transformer",
                 )
             else:
-                log.warning("No transformer linear modules found; skipping LoRA injection for transformer.")
+                log.info("No trainable transformer linear modules; skipping LoRA injection for transformer.")
         else:
             log.info("Transformer already has LoRA adapters; skipping reinjection.")
 
         if getattr(model, "vision_backbone", None) is not None:
             if not hasattr(model.vision_backbone, "peft_config"):
-                vision_targets = _collect_linear_leaf_names(model.vision_backbone)
+                vision_targets = _collect_lora_targets(model.vision_backbone)
                 if vision_targets:
                     log.info("LoRA vision target modules: %s", vision_targets)
                     model.vision_backbone = _wrap_with_lora(
@@ -444,7 +442,7 @@ def run_trainer(cfg: TrainConfig) -> None:
                         label="vision_backbone",
                     )
                 else:
-                    log.warning("No vision linear modules found; skipping LoRA injection for vision backbone.")
+                    log.info("No trainable vision linear modules; skipping LoRA injection for vision backbone.")
             else:
                 log.info("Vision backbone already has LoRA adapters; skipping reinjection.")
 
