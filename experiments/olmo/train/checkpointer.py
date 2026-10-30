@@ -104,7 +104,17 @@ def merge_and_save_unsharded(
     This function must be called on all ranks. It performs distributed state-dict collection
     before rank0-only merge/write to keep collective ordering consistent.
     """
-    from peft import PeftModel
+    from peft import LoraConfig, get_peft_model
+
+    def merge_module(module, adapter_dir, state):
+        lora_config = LoraConfig.from_pretrained(adapter_dir)
+        # Checkpoint wrappers disappear from state-dict keys and from the fresh model.
+        lora_config.target_modules = {
+            name.replace("_checkpoint_wrapped_module.", "") for name in lora_config.target_modules
+        }
+        with_lora = get_peft_model(module, lora_config)
+        with_lora.load_state_dict(state, strict=True)
+        return with_lora.merge_and_unload()
 
     if full_state is None:
         sd_options = dist_cp_sd.StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -133,9 +143,9 @@ def merge_and_save_unsharded(
         if not transformer_state:
             log.warning("No transformer weights found when saving merged LoRA checkpoint.")
         else:
-            transformer_with_lora = PeftModel.from_pretrained(merged_model.transformer, checkpoint_dir_llm)
-            transformer_with_lora.load_state_dict(transformer_state, strict=False)
-            merged_model.transformer = transformer_with_lora.merge_and_unload()
+            merged_model.transformer = merge_module(
+                merged_model.transformer, checkpoint_dir_llm, transformer_state
+            )
 
         if getattr(merged_model, "vision_backbone", None) is not None and checkpoint_dir_vision is not None:
             if not os.path.exists(checkpoint_dir_vision):
@@ -143,12 +153,9 @@ def merge_and_save_unsharded(
             elif not vision_state:
                 log.warning("No vision backbone weights found when saving merged LoRA checkpoint.")
             else:
-                vision_with_lora = PeftModel.from_pretrained(
-                    merged_model.vision_backbone,
-                    checkpoint_dir_vision,
+                merged_model.vision_backbone = merge_module(
+                    merged_model.vision_backbone, checkpoint_dir_vision, vision_state
                 )
-                vision_with_lora.load_state_dict(vision_state, strict=False)
-                merged_model.vision_backbone = vision_with_lora.merge_and_unload()
 
         merged_state_dict = merged_model.state_dict()
         write_file(dir, MODEL_FILENAME, lambda f: torch.save(merged_state_dict, f), overwrite)
