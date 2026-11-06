@@ -161,6 +161,13 @@ class LossDatasetEvaluator:
     save_data: Optional[SaveEvalDataConfig] = None
     response_logits_only: bool = False
 
+    def close(self):
+        # PyTorch has no public close method for persistent DataLoader workers.
+        iterator = getattr(self.eval_loader, "_iterator", None)
+        if iterator is not None:
+            iterator._shutdown_workers()
+            self.eval_loader._iterator = None
+
     def run(
             self, 
             model, 
@@ -251,10 +258,13 @@ class LossDatasetEvaluator:
 
         if logger:
             logger.log_evaluation(self.label, num_eval_batches, num_eval_batches)
+        log.info("Computing evaluation metrics for '%s'...", self.label)
+        metrics = self.evaluator.compute()
+        log.info("Evaluation metrics for '%s' computed.", self.label)
         if self.save_data:
-            return self.evaluator.compute(), viz_data
+            return metrics, viz_data
         else:
-            return self.evaluator.compute()
+            return metrics
 
 
 @dataclass

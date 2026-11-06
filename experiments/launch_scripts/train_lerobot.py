@@ -1218,13 +1218,16 @@ def main():
         ) if args.packing else None,
     )
     if args.eval_split > 0.0:
+        eval_num_workers = args.eval_num_workers if args.eval_num_workers is not None else num_workers
         eval_data_cfg = replace(
             primary_data_cfg,
             kwargs_mixture=training_data_plan.robot_mixture,
             shuffle=False,
             split="validation",
             drop_last=False,
-            num_workers=args.eval_num_workers if args.eval_num_workers is not None else num_workers,
+            num_workers=eval_num_workers,
+            # Reuse workers instead of stopping video decoders after each short evaluation.
+            persistent_workers=eval_num_workers > 0,
             packing=None,
             skip_overlong_examples=False,
             skip_missing_vlm_examples=False,

@@ -2941,6 +2941,8 @@ class Trainer:
                 log.info(f"Checkpoint saved to {checkpoint_path}")
 
     def close(self, exit_code: int = 0) -> None:
+        for evaluator in self.evaluators or []:
+            evaluator.close()
         if wandb.run is not None:
             if exit_code != 0:
                 log.info(f"Finishing wandb with exit code {exit_code}")
