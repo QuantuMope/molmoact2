@@ -757,10 +757,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Build a mapping: absolute_index -> relative_index_in_filtered_dataset
         self._absolute_to_relative_idx = None
         if self.episodes is not None:
-            self._absolute_to_relative_idx = {
-                abs_idx.item() if isinstance(abs_idx, torch.Tensor) else abs_idx: rel_idx
-                for rel_idx, abs_idx in enumerate(self.hf_dataset["index"])
-            }
+            # Read the column once instead of constructing one Torch tensor per row.
+            indices = self.hf_dataset.select_columns(["index"]).with_format("numpy")[:]["index"]
+            self._absolute_to_relative_idx = dict(zip(indices.reshape(-1).tolist(), range(len(indices))))
 
         # Setup delta_indices
         if self.delta_timestamps is not None:

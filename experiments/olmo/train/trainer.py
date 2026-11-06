@@ -1134,6 +1134,10 @@ class Trainer:
     def _get_train_batch_from_loader(self, loader: DataLoader, *, use_vlm_loader: bool) -> Dict[str, Any]:
         iterator_attr = "_vlm_loader_iter" if use_vlm_loader else "_train_loader_iter"
         loader_iter = getattr(self, iterator_attr)
+        first_batch = loader_iter is None
+        if first_batch:
+            startup = time.perf_counter()
+            log.info("Starting %s data loader workers...", "VLM" if use_vlm_loader else "training")
         if loader_iter is None:
             loader_iter = iter(loader)
 
@@ -1144,6 +1148,9 @@ class Trainer:
             batch = next(loader_iter)
 
         setattr(self, iterator_attr, loader_iter)
+        if first_batch:
+            log.info("First %s batch ready in %.1f seconds.",
+                     "VLM" if use_vlm_loader else "training", time.perf_counter() - startup)
         return batch
 
     def _should_use_vlm_loader_for_next_step(self) -> bool:

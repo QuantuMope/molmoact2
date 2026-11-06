@@ -1459,6 +1459,8 @@ class LeRobotDatasetWrapper(Dataset):
 
     recorded_demonstrations = False
     _recorded_action_lengths = None
+    _cached_delta_actions = None
+    _episode_index_ready = False
 
     def __init__(
         self,
@@ -1782,17 +1784,8 @@ class LeRobotDatasetWrapper(Dataset):
             "revision",
             self._dataset_reopen_kwargs.get("revision"),
         )
-        self._episode_ranges = None
-        self._episode_cumulative = None
-        self._sample_indices = None
-        self._filtered_action_indices = None
-        self._filtered_next_indices = None
-        self._filtered_action_offsets = None
-        self._filtered_state_action_dataset = None
-        self._effective_len = None
-        self.static_filter_total_frames = 0
-        self.static_filter_static_frames = 0
-        self._build_episode_index()
+        if not self._episode_index_ready:
+            self._build_episode_index()
 
     def _load_depth_dataset_from_kwargs(self, depth_kwargs: Dict[str, Any]) -> LeRobotDataset:
         repo_id = depth_kwargs.get("repo_id")
@@ -1853,19 +1846,9 @@ class LeRobotDatasetWrapper(Dataset):
 
     def __getstate__(self) -> Dict[str, Any]:
         state = dict(self.__dict__)
-        dataset = state.get("dataset")
-        if dataset is not None:
-            reopen_kwargs = dict(state.get("_dataset_reopen_kwargs") or {})
-            reopen_kwargs.setdefault("repo_id", getattr(dataset, "repo_id", None))
-            dataset_root = getattr(dataset, "root", None)
-            reopen_kwargs.setdefault("root", None if dataset_root is None else str(dataset_root))
-            reopen_kwargs["revision"] = getattr(dataset, "revision", reopen_kwargs.get("revision"))
-            state["_dataset_reopen_kwargs"] = reopen_kwargs
-            try:
-                state["_cached_dataset_len"] = len(dataset)
-            except Exception:
-                pass
-            state["dataset"] = None
+        # Read-only LeRobot/HF datasets are pickleable. Arrow tables reopen their
+        # memory maps in workers; dropping the dataset forced a full Parquet reload
+        # and repeated preprocessing in every spawned worker.
         depth_dataset = state.get("_depth_dataset")
         if depth_dataset is not None:
             reopen_kwargs = dict(state.get("_depth_dataset_reopen_kwargs") or {})
@@ -2644,6 +2627,8 @@ class LeRobotDatasetWrapper(Dataset):
         offset = int(self._filtered_action_offsets[sample_index])
         stride = self._filtered_action_stride
         end = offset + self.tag_action_horizon * stride
+        if self._cached_delta_actions is not None:
+            return self._cached_delta_actions[offset:end:stride].copy()
         action_indices = self._filtered_action_indices[offset:end:stride]
         next_indices = self._filtered_next_indices[offset + stride - 1:end:stride]
         gripper_indices = self._filtered_gripper_indices[offset + stride - 1:end:stride]
@@ -2696,6 +2681,13 @@ class LeRobotDatasetWrapper(Dataset):
         return action
 
     def _build_episode_index(self) -> None:
+        from olmo.data.lerobot_preprocessing_cache import build_or_load
+
+        build_or_load(self, self._preprocess_episode_index)
+        self._episode_index_ready = True
+
+    def _preprocess_episode_index(self) -> None:
+        self._cached_delta_actions = None
         if self.recorded_demonstrations:
             columns = ["action.valid", "task_index", "episode_index", "frame_index"]
             rows = self.dataset.hf_dataset.select_columns(columns).with_format("numpy")[:]
@@ -2766,6 +2758,7 @@ class LeRobotDatasetWrapper(Dataset):
         filtered_next_indices: List[int] = []
         filtered_gripper_indices: List[int] = []
         filtered_action_offsets: List[int] = []
+        cached_actions = []
         static_filter_total = 0
         retained_transition_count = 0
         ranges: List[Tuple[int, int]] = []
@@ -2797,6 +2790,19 @@ class LeRobotDatasetWrapper(Dataset):
                     state = state[0]
                 states.append(state.reshape(-1))
             return np.stack(states)
+
+        def raw_actions_at(row_indices):
+            if hf_dataset is not None:
+                rows = hf_dataset.select_columns(list(self.action_keys)).with_format("numpy")[list(row_indices)]
+                return np.concatenate([
+                    np.asarray(rows[key], dtype=np.float32).reshape(len(row_indices), -1)
+                    for key in self.action_keys
+                ], axis=-1)
+            return np.stack([
+                np.asarray(_extract_vector(self.dataset[index], self.action_keys, "action.")[0],
+                           dtype=np.float32).reshape(1, -1)[0]
+                for index in row_indices
+            ])
 
         for ep_idx in episode_ids:
             try:
@@ -2903,6 +2909,7 @@ class LeRobotDatasetWrapper(Dataset):
                     filtered_gripper_indices.extend(episode_gripper_indices)
                     stride = self._filtered_action_stride
                     num_anchors = len(episode_kept_indices) - self.tag_action_horizon * stride + 1
+                    episode_actions = np.zeros((len(episode_kept_indices), current_states.shape[-1]), dtype=np.float32)
                     if num_anchors > 0:
                         deltas = _compute_action_delta(
                             current_states[:len(current_states) - stride + 1],
@@ -2910,6 +2917,11 @@ class LeRobotDatasetWrapper(Dataset):
                             self.delta_action_mode,
                         )
                         limit = self.delta_action_limits
+                        actions = np.clip(deltas, -limit, limit).astype(np.float32)
+                        if self.gripper_indices:
+                            grippers = raw_actions_at(episode_gripper_indices[stride - 1:])
+                            actions[:, self.gripper_indices] = grippers[:, self.gripper_indices]
+                        episode_actions[:len(actions)] = actions
                         clipped_dims = np.abs(deltas) > limit
                         clipped_dims[:, self.gripper_indices] = False
                         clipped_actions = np.any(clipped_dims, axis=-1)
@@ -2940,6 +2952,7 @@ class LeRobotDatasetWrapper(Dataset):
                         self.delta_action_clipped_chunks += int(np.count_nonzero(clipped_chunks))
                         self.delta_action_total_chunks += num_anchors
                         self.delta_action_total_actions += num_anchors * self.tag_action_horizon
+                    cached_actions.append(episode_actions)
                     for pos in range(max(num_anchors, 0)):
                         row_idx = episode_kept_indices[pos]
                         kept_indices.append(row_idx)
@@ -2976,6 +2989,7 @@ class LeRobotDatasetWrapper(Dataset):
                     self._filtered_next_indices = np.asarray(filtered_next_indices, dtype=np.int64)
                     self._filtered_gripper_indices = np.asarray(filtered_gripper_indices, dtype=np.int64)
                     self._filtered_action_offsets = np.asarray(filtered_action_offsets, dtype=np.int64)
+                    self._cached_delta_actions = np.concatenate(cached_actions)
                 self._effective_len = len(kept_indices)
                 if self.use_delta_action:
                     log.info(

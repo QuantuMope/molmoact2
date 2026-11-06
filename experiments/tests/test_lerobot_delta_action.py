@@ -218,7 +218,7 @@ def test_filtered_delta_action_chunks_use_filtered_transition_order():
     np.testing.assert_array_equal(wrapper._filtered_next_indices, [1, 3])
     np.testing.assert_array_equal(wrapper._filtered_action_offsets, [0])
     np.testing.assert_allclose(wrapper._build_filtered_delta_action(0)[:, 0], [0.2, 0.3])
-    assert wrapper.dataset.hf_dataset.batch_reads == 2
+    assert wrapper.dataset.hf_dataset.batch_reads == 1
     assert wrapper.dataset.hf_dataset.scalar_reads == 0
 
 
