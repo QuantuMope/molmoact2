@@ -1422,6 +1422,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         # Convert buffer into HF Dataset
         ep_dict = {key: episode_buffer[key] for key in self.hf_features}
+        # Shape-(1,) features become HF scalar columns. NumPy 2.4 rejects
+        # converting their one-element row arrays to Python scalars.
+        for key in ep_dict:
+            if tuple(self.features[key]["shape"]) == (1,):
+                ep_dict[key] = np.asarray(ep_dict[key]).reshape(-1)
         ep_dataset = datasets.Dataset.from_dict(ep_dict, features=self.hf_features, split="train")
         ep_dataset = embed_images(ep_dataset)
         ep_num_frames = len(ep_dataset)
