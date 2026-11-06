@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 from dataclasses import dataclass, fields, replace
+from functools import partial
 from typing import Dict, List, Optional, Sequence
 
 from launch_scripts.data_mixtures import (
@@ -315,6 +316,7 @@ def _build_piper_x_molmo2_er_training_data_plan(
     robot_style_mixture: Dict[str, float],
     raw_vlm_mixture=MOLMO2_ER_SPATIAL_VLM_MIXTURE,
     vlm_mixture_ratio: float = PIPER_X_MOLMO2_ER_VLM_COMBINED_RATE,
+    piper_data_weights: Optional[Dict[str, float]] = None,
 ) -> LeRobotTrainingDataPlan:
     try:
         piper_x_builder = MOLMOACT2_LEROBOT_MIXTURES["piper_x"]
@@ -323,7 +325,7 @@ def _build_piper_x_molmo2_er_training_data_plan(
 
     robot_plan = _build_robot_only_training_data_plan(
         "piper_x",
-        piper_x_builder,
+        partial(piper_x_builder, **(piper_data_weights or {})),
         robot_style_mixture,
     )
     vlm_mixture = _build_kwargs_mixture_from_raw_mixture(raw_vlm_mixture)
@@ -356,6 +358,9 @@ def get_lerobot_training_data_plan(
     style_robot_depth: float = 0.0,
     style_robot_depth_action: float = 0.0,
     vlm_mixture_ratio: float = PIPER_X_MOLMO2_ER_VLM_COMBINED_RATE,
+    pick_and_place_data_weight: float = 1.,
+    triple_cube_stack_data_weight: float = 0.,
+    bimanual_pot_lift_data_weight: float = 0.,
 ) -> LeRobotTrainingDataPlan:
     reset_tag_metadata()
 
@@ -364,16 +369,23 @@ def get_lerobot_training_data_plan(
         "robot_depth": float(style_robot_depth),
         "robot_depth_action": float(style_robot_depth_action),
     }
+    piper_data_weights = dict(
+        pick_and_place_data_weight=pick_and_place_data_weight,
+        triple_cube_stack_data_weight=triple_cube_stack_data_weight,
+        bimanual_pot_lift_data_weight=bimanual_pot_lift_data_weight,
+    )
     if name == "piper_x_molmo2_er":
         return _build_piper_x_molmo2_er_training_data_plan(
             robot_style_mixture,
             vlm_mixture_ratio=vlm_mixture_ratio,
+            piper_data_weights=piper_data_weights,
         )
     if name == "piper_x_selected_molmo2_er":
         return _build_piper_x_molmo2_er_training_data_plan(
             robot_style_mixture,
             raw_vlm_mixture=PIPER_X_SELECTED_MOLMO2_ER_VLM_MIXTURE,
             vlm_mixture_ratio=vlm_mixture_ratio,
+            piper_data_weights=piper_data_weights,
         )
 
     try:
@@ -384,6 +396,8 @@ def get_lerobot_training_data_plan(
             f"Unknown LeRobot mixture '{name}'. Supported mixtures: {supported}."
         ) from exc
 
+    if name == "piper_x":
+        builder = partial(builder, **piper_data_weights)
     return _build_robot_only_training_data_plan(name, builder, robot_style_mixture)
 
 

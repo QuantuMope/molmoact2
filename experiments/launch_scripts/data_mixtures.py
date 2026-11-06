@@ -451,26 +451,52 @@ def build_molmoact2_libero_goal() -> Tuple[List[RawMixtureEntry], Dict[str, Dict
     )
 
 
-def build_molmoact2_piper_x():
-    return build_single_lerobot_mixture(
-        name="piper_x",
-        tag="piper_x",
-        repo_ids=["lerobot_test"],
-        action_key="action",
-        state_keys=["observation.state"],
-        camera_keys=[
-            "observation.images.front",
-            "observation.images.left_wrist",
-            "observation.images.right_wrist",
-        ],
-        normalize_gripper=False,
-        setup_type="bimanual piper-x robotic arms",
-        control_mode="absolute joint pose",
-        action_dim=14,
-        action_horizon=8,
-        n_action_steps=8
-
-    )
+def build_molmoact2_piper_x(pick_and_place_data_weight=1., triple_cube_stack_data_weight=0.,
+                          bimanual_pot_lift_data_weight=0.):
+    sources = [
+        ("piper_x", "piper_x_pick_and_place", pick_and_place_data_weight),
+        ("piper_x_triple_cube_stack", "piper_x_triple_cube_stack_v1", triple_cube_stack_data_weight),
+        ("piper_x_bimanual_pot_lift", "piper_x_bimanual_pot_lift_v1", bimanual_pot_lift_data_weight),
+    ]
+    total = sum(weight for _, _, weight in sources)
+    if total <= 0 or any(weight < 0 for _, _, weight in sources):
+        raise ValueError("Piper-X data weights must be nonnegative with a positive total.")
+    generated_data = triple_cube_stack_data_weight > 0 or bimanual_pot_lift_data_weight > 0
+    mixture, metadata = [], {}
+    for tag, repo_id, weight in sources:
+        if weight == 0:
+            continue
+        entries, tags = build_single_lerobot_mixture(
+            name="piper_x",
+            tag=tag,
+            repo_ids=[repo_id],
+            action_key="action",
+            state_keys=["observation.state"],
+            camera_keys=[
+                "observation.images.front",
+                "observation.images.left_wrist",
+                "observation.images.right_wrist",
+            ],
+            normalize_gripper=generated_data,
+            setup_type="bimanual piper-x robotic arms",
+            control_mode="absolute joint pose",
+            action_dim=14,
+            action_horizon=8,
+            n_action_steps=8,
+            rate=weight / total,
+        )
+        if tag != "piper_x":
+            tags[f"lerobot:{tag}"].update(
+                control_mode="delta end effector pose",
+                normalized_action_limits=[.04] * 3 + [.08] * 3,
+                recorded_demonstrations=True,
+                state_gripper_max=.05,
+                static_threshold=0.,
+                gripper_indices=[6, 13],
+            )
+        mixture.extend(entries)
+        metadata.update(tags)
+    return mixture, metadata
 
 
 def build_molmoact2_yam() -> Tuple[List[RawMixtureEntry], Dict[str, Dict[str, object]]]:

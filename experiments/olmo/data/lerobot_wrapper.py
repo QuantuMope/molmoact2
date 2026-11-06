@@ -596,11 +596,16 @@ def _select_split_episodes(
 
     seed = _get_env_non_negative_int("LEROBOT_EVAL_SPLIT_SEED", 0)
     rng = np.random.default_rng(seed)
-    shuffled = np.asarray(base_episodes, dtype=np.int64).copy()
-    rng.shuffle(shuffled)
-    n_eval = int(round(len(base_episodes) * eval_fraction))
-    n_eval = min(max(n_eval, 1), len(base_episodes) - 1)
-    eval_episodes = set(int(v) for v in shuffled[:n_eval])
+    groups_path = dataset_root / "meta" / "episode_groups.json" if dataset_root else None
+    groups = (json.loads(groups_path.read_text()).values() if groups_path and groups_path.exists()
+              else [base_episodes])
+    available = set(base_episodes)
+    eval_episodes = set()
+    for group in groups:
+        shuffled = np.asarray([ep for ep in group if ep in available], dtype=np.int64)
+        rng.shuffle(shuffled)
+        n_eval = min(max(round(len(shuffled) * eval_fraction), 1), len(shuffled) - 1)
+        eval_episodes.update(int(v) for v in shuffled[:max(n_eval, 0)])
 
     if normalized_split == "train":
         selected = [ep for ep in base_episodes if ep not in eval_episodes]
@@ -1452,6 +1457,9 @@ def _validate_depth_side_channel_length(
 class LeRobotDatasetWrapper(Dataset):
     """Converts LeRobotDataset frames into Molmo-style examples."""
 
+    recorded_demonstrations = False
+    _recorded_action_lengths = None
+
     def __init__(
         self,
         dataset: LeRobotDataset,
@@ -1485,6 +1493,8 @@ class LeRobotDatasetWrapper(Dataset):
         tag_action_horizon: int = 1,
         tag_n_action_steps: int = 1,
         use_delta_action: bool = False,
+        normalized_action_limits: Optional[Sequence[float]] = None,
+        recorded_demonstrations: bool = False,
         append_ee_pose_to_observation: bool = False,
         active_arm: str = "both",
         delta_joint_limit: float = 0.1,
@@ -1572,6 +1582,9 @@ class LeRobotDatasetWrapper(Dataset):
         self.state_keys = _require_non_empty_string_sequence(state_keys, label="state_keys")
         self.action_keys = _require_non_empty_string_sequence(action_keys, label="action_keys")
         self.use_delta_action = bool(use_delta_action)
+        self.normalized_action_limits = normalized_action_limits
+        self.recorded_demonstrations = recorded_demonstrations
+        self._recorded_action_lengths = None
         self.append_ee_pose_to_observation = append_ee_pose_to_observation
         self.active_arm = active_arm
         self.delta_joint_limit = float(delta_joint_limit)
@@ -2683,6 +2696,22 @@ class LeRobotDatasetWrapper(Dataset):
         return action
 
     def _build_episode_index(self) -> None:
+        if self.recorded_demonstrations:
+            columns = ["action.valid", "task_index", "episode_index", "frame_index"]
+            rows = self.dataset.hf_dataset.select_columns(columns).with_format("numpy")[:]
+            valid = np.asarray(rows["action.valid"]).reshape(-1).astype(bool)
+            tasks, episodes, frames = [np.asarray(rows[key]).reshape(-1) for key in columns[1:]]
+            lengths = np.zeros(len(valid), dtype=np.int32)
+            for index in range(len(valid) - 1, -1, -1):
+                if valid[index]:
+                    lengths[index] = 1
+                    if (index + 1 < len(valid) and episodes[index] == episodes[index + 1]
+                            and tasks[index] == tasks[index + 1] and frames[index + 1] == frames[index] + 1):
+                        lengths[index] += lengths[index + 1]
+            self._recorded_action_lengths = lengths
+            self._sample_indices = np.flatnonzero(valid).tolist()
+            self._effective_len = len(self._sample_indices)
+            return
         adaptive_stride = getattr(self, "adaptive_stride", False)
         self._filtered_action_stride = 1 if adaptive_stride else max(self.action_stride, 1)
         self.adaptive_stride_counts = {}
@@ -3186,6 +3215,12 @@ class LeRobotDatasetWrapper(Dataset):
                     self.delta_ee_xyz_limit,
                     self.delta_ee_rpy_limit,
                 )
+        if self.normalized_action_limits is not None:
+            # Decode recorded commands, without reconstructing motion from states.
+            action = action.copy()
+            arms = action.reshape(*action.shape[:-1], -1, 7)
+            arms[..., :6] *= self.normalized_action_limits
+            arms[..., 6] = (arms[..., 6] + 1.) / 2
         if self.append_ee_pose_to_observation:
             from olmo.piper_kinematics import append_piper_ee_pose
             state = append_piper_ee_pose(state)
@@ -3207,6 +3242,11 @@ class LeRobotDatasetWrapper(Dataset):
                 max_action_horizon=self.max_action_horizon,
             )
             action, action_dim_is_pad = self._pad_action_to_max_dim(action, repo_id)
+            if self._recorded_action_lengths is not None:
+                length = int(self._recorded_action_lengths[dataset_row_index])
+                action_time_is_pad[length:] = True
+                action = action.copy()
+                action[length:] = 0.
         if state is None and not self._warned_missing_state:
             log.warning("LeRobot example does not contain any state vectors")
             self._warned_missing_state = True
@@ -3772,7 +3812,7 @@ def build_lerobot_dataset(
         observation_indices=obs_indices,
         action_indices=action_indices,
         drop_n_last_frames=drop_n_last_frames,
-        static_threshold=static_threshold,
+        static_threshold=float(tag_metadata.get("static_threshold", static_threshold)),
         style=style,
         style_sampling_rates=style_sampling_rates,
         action_format=action_format,
@@ -3793,6 +3833,8 @@ def build_lerobot_dataset(
         tag_action_horizon=tag_action_horizon,
         tag_n_action_steps=tag_n_action_steps,
         use_delta_action=use_delta_action,
+        normalized_action_limits=tag_metadata.get("normalized_action_limits"),
+        recorded_demonstrations=bool(tag_metadata.get("recorded_demonstrations", False)),
         delta_joint_limit=delta_joint_limit,
         action_stride=action_stride,
         adaptive_stride=bool(tag_metadata.get("adaptive_stride", False)),

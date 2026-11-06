@@ -205,6 +205,9 @@ def _apply_joint_limit_normalization_stats(
                 metadata,
                 tag_stats[state_key],
             )
+            if "state_gripper_max" in metadata:
+                for index in range(6, int(metadata["action_dim"]), 7):
+                    tag_stats[state_key]["max"][index] = metadata["state_gripper_max"]
 
         metadata["joint_limit_normalization"] = True
         tag_metadata_by_tag[tag] = metadata
@@ -233,6 +236,7 @@ def _apply_delta_action_stats(
 
         action_key = str(metadata.get("action_key") or "action")
         action_stats = dict(tag_stats[action_key])
+        recorded_actions = "normalized_action_limits" in metadata
         arm_indices = [i for i in range(action_dim) if i not in _PIPER_X_GRIPPER_INDICES]
         limits = (piper_ee_limits(delta_ee_xyz_limit, delta_ee_rpy_limit)
                   if delta_action_mode == "ee" else [delta_joint_limit] * action_dim)
@@ -247,17 +251,21 @@ def _apply_delta_action_stats(
             "q90": 1.0,
         }
         for key, replacement in replacements.items():
-            values = action_stats.get(key)
+            values = [replacement] * action_dim if recorded_actions else action_stats.get(key)
             if isinstance(values, list) and len(values) == action_dim:
                 values = list(values)
                 for index in arm_indices:
                     values[index] = float(replacement * limits[index])
+                if recorded_actions:
+                    # Decode stored grippers to [0, 1] before model normalization.
+                    for index in range(6, action_dim, 7):
+                        values[index] = .5 if key in ("mean", "std") else max(0., replacement)
                 action_stats[key] = values
         tag_stats[action_key] = action_stats
-        metadata["use_delta_action"] = True
+        metadata["use_delta_action"] = not recorded_actions
         metadata["delta_joint_limit"] = delta_joint_limit
-        metadata["action_stride"] = action_stride
-        metadata["adaptive_stride"] = adaptive_stride and delta_action_mode == "ee"
+        metadata["action_stride"] = 1 if recorded_actions else action_stride
+        metadata["adaptive_stride"] = not recorded_actions and adaptive_stride and delta_action_mode == "ee"
         metadata["delta_action_mode"] = delta_action_mode
         metadata["gripper_indices"] = list(range(6, action_dim, 7))
         metadata["control_mode"] = "delta end effector pose" if delta_action_mode == "ee" else "delta joint pose"
@@ -393,6 +401,12 @@ def main():
     parser = argparse.ArgumentParser(prog="Train a multitask model")
     parser.add_argument("checkpoint", help="Path to checkpoint to start from")
     parser.add_argument("mixture", nargs="?", default="pre_post_train")
+    parser.add_argument("--pick_and_place_data_weight", type=float, default=1.,
+                        help="Relative weight of the existing Piper-X dataset.")
+    parser.add_argument("--triple_cube_stack_data_weight", type=float, default=0.,
+                        help="Relative weight of piper_x_triple_cube_stack_v1 (0 skips it).")
+    parser.add_argument("--bimanual_pot_lift_data_weight", type=float, default=0.,
+                        help="Relative weight of piper_x_bimanual_pot_lift_v1 (0 skips it).")
     parser.add_argument("--camera_keys", default=None,
                         help="Comma-separated dataset camera keys, in model input order.")
     parser.add_argument("--active_arm", choices=["both", "left"], default="both",
@@ -814,6 +828,9 @@ def main():
         raise ValueError("--use_delta_action requires action normalization.")
     if args.delta_action_mode == "ee" and not args.use_delta_action:
         raise ValueError("--delta_action_mode=ee requires --use_delta_action=true.")
+    if (args.triple_cube_stack_data_weight > 0 or args.bimanual_pot_lift_data_weight > 0) and not (
+            args.use_delta_action and args.delta_action_mode == "ee"):
+        raise ValueError("Generated Piper-X data requires --use_delta_action=true --delta_action_mode=ee.")
     if args.delta_action_mode == "joint" and args.delta_joint_limit <= 0:
         raise ValueError("--delta_joint_limit must be > 0.")
     prepare_torchrun_environment()
@@ -833,6 +850,9 @@ def main():
         style_robot_depth=float(args.style_robot_depth),
         style_robot_depth_action=float(args.style_robot_depth_action),
         vlm_mixture_ratio=float(args.vlm_mixture_ratio),
+        pick_and_place_data_weight=args.pick_and_place_data_weight,
+        triple_cube_stack_data_weight=args.triple_cube_stack_data_weight,
+        bimanual_pot_lift_data_weight=args.bimanual_pot_lift_data_weight,
     )
     training_tag_metadata = _override_action_chunk_size(
         TAG_METADATA_BY_TAG,
